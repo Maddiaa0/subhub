@@ -395,6 +395,7 @@ fn save_json_file(path: &Path, value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn adding_names_is_sorted_and_marks_active() {
@@ -430,5 +431,47 @@ mod tests {
     fn legacy_vault_entry_requires_refresh() {
         let raw = r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r"}}"#;
         assert!(decode_vault_entry(raw).is_err());
+    }
+
+    #[test]
+    fn index_write_never_stores_sensitive_credential_data() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!(
+            "sub-manager-index-test-{}-{unique}",
+            std::process::id()
+        ));
+        let path = directory.join("index.json");
+
+        let mut index = Index::new();
+        index.add("personal");
+        save_index(&path, &index).unwrap();
+
+        let written = fs::read_to_string(&path).unwrap();
+        let parsed: Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "version": 1,
+                "active": "personal",
+                "credentials": ["personal"]
+            })
+        );
+        for sensitive_field in [
+            "accessToken",
+            "refreshToken",
+            "claudeAiOauth",
+            "oauthAccount",
+            "emailAddress",
+        ] {
+            assert!(
+                !written.contains(sensitive_field),
+                "index leaked sensitive field {sensitive_field}"
+            );
+        }
+
+        fs::remove_dir_all(directory).unwrap();
     }
 }
