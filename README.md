@@ -21,14 +21,14 @@ subhub list
 subhub set <name>
 subhub audit
 subhub audit --json
-subhub serve
-subhub install
-subhub uninstall
-subhub start
-subhub stop
-subhub restart
-subhub status
-subhub auth-token
+subhub gateway serve
+subhub gateway install
+subhub gateway uninstall
+subhub gateway start
+subhub gateway stop
+subhub gateway restart
+subhub gateway status
+subhub gateway auth-token
 subhub help
 ```
 
@@ -76,7 +76,7 @@ is rejected with `401` or `429` before streaming begins, it can retry once with
 another eligible credential.
 
 ```sh
-subhub serve
+subhub gateway serve
 ```
 
 The command prints values to use in the shell where Claude Code will run:
@@ -97,7 +97,7 @@ or response contents, and defaults to retaining one percent of each applicable
 usage window:
 
 ```sh
-subhub serve --reserve-percent 1 --audit-interval 120
+subhub gateway serve --reserve-percent 1 --audit-interval 120
 ```
 
 With the proxy running, its sanitized state is available at:
@@ -122,7 +122,7 @@ After installing the executable, enable the persistent gateway once:
 
 ```sh
 cargo install --path .
-subhub install
+subhub gateway install
 ```
 
 `install` creates and starts the per-user macOS LaunchAgent
@@ -135,19 +135,20 @@ or process arguments.
 Manage the installed gateway with:
 
 ```sh
-subhub status
-subhub stop
-subhub start
-subhub restart
+subhub gateway status
+subhub gateway stop
+subhub gateway start
+subhub gateway restart
 ```
 
-`subhub serve` remains available for foreground debugging. When a persistent
-token exists, it uses that token; otherwise it prints an ephemeral local token.
+`subhub gateway serve` remains available for foreground debugging. When a
+persistent token exists, it uses that token; otherwise it prints an ephemeral
+local token.
 
 Remove the background integration while preserving saved accounts:
 
 ```sh
-subhub uninstall
+subhub gateway uninstall
 ```
 
 Installation records the previous `ANTHROPIC_BASE_URL` and `apiKeyHelper`
@@ -156,19 +157,19 @@ Subhub, so subsequent user edits are not overwritten.
 
 Claude settings containing `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` must
 be cleaned up before installation because those values take precedence over
-the helper. `subhub status` also warns when either variable is inherited from
-the current shell.
+the helper. `subhub gateway status` also warns when either variable is
+inherited from the current shell.
 
 To also delete Subhub's indexed credentials, Keychain entries, and gateway
 token:
 
 ```sh
-subhub uninstall --purge
+subhub gateway uninstall --purge
 ```
 
 `auth-token` prints the local gateway token for diagnostics and should be
 treated as sensitive:
 
 ```sh
-subhub auth-token
+subhub gateway auth-token
 ```

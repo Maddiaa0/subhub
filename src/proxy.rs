@@ -69,7 +69,7 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         Some(token) => token,
         None if options.background => {
             return Err(AppError(
-                "background gateway token is missing; run `subhub install` again".into(),
+                "background gateway token is missing; run `subhub gateway install` again".into(),
             ));
         }
         None => Alphanumeric.sample_string(&mut rand::rng(), 32),

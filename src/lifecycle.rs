@@ -137,7 +137,7 @@ pub(crate) fn start() -> Result<()> {
     let agent_path = launch_agent_path()?;
     if !agent_path.exists() {
         return Err(AppError(
-            "Subhub is not installed; run `subhub install`".into(),
+            "Subhub is not installed; run `subhub gateway install`".into(),
         ));
     }
     let target = launch_target()?;
@@ -315,6 +315,7 @@ fn write_launch_agent(path: &Path, binary: &Path) -> Result<()> {
   <key>ProgramArguments</key>
   <array>
     <string>{binary}</string>
+    <string>gateway</string>
     <string>serve</string>
     <string>--background</string>
   </array>
@@ -343,7 +344,10 @@ fn write_auth_helper(path: &Path, binary: &Path) -> Result<()> {
         .parent()
         .ok_or_else(|| AppError("auth helper path has no parent".into()))?;
     fs::create_dir_all(parent)?;
-    let contents = format!("#!/bin/sh\nexec {} auth-token\n", shell_quote(binary));
+    let contents = format!(
+        "#!/bin/sh\nexec {} gateway auth-token\n",
+        shell_quote(binary)
+    );
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true).mode(0o700);
     let mut file = options.open(path)?;
@@ -629,11 +633,12 @@ mod tests {
 
         let agent_contents = fs::read_to_string(&agent).unwrap();
         let helper_contents = fs::read_to_string(&helper).unwrap();
+        assert!(agent_contents.contains("<string>gateway</string>"));
         assert!(agent_contents.contains("<string>--background</string>"));
         assert!(!agent_contents.contains("local-client-token"));
         assert_eq!(
             helper_contents,
-            "#!/bin/sh\nexec '/Applications/Sub Hub/subhub' auth-token\n"
+            "#!/bin/sh\nexec '/Applications/Sub Hub/subhub' gateway auth-token\n"
         );
         assert_eq!(
             fs::metadata(&helper).unwrap().permissions().mode() & 0o777,

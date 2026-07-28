@@ -86,6 +86,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Manage the local Anthropic credential gateway
+    Gateway {
+        #[command(subcommand)]
+        command: GatewayCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum GatewayCommands {
     /// Run the local credential-routing Anthropic proxy
     Serve {
         /// Loopback address to listen on
@@ -187,14 +196,20 @@ fn dispatch(cli: Cli) -> Result<()> {
             let credentials = stored_credentials(&index)?;
             runtime()?.block_on(audit(credentials, json))
         }
-        Commands::Serve {
+        Commands::Gateway { command } => dispatch_gateway(command, &index),
+    }
+}
+
+fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
+    match command {
+        GatewayCommands::Serve {
             listen,
             client_token,
             reserve_percent,
             audit_interval,
             background,
         } => {
-            let credentials = stored_credentials(&index)?;
+            let credentials = stored_credentials(index)?;
             runtime()?.block_on(proxy::serve(proxy::ServeOptions {
                 listen,
                 client_token,
@@ -204,13 +219,13 @@ fn dispatch(cli: Cli) -> Result<()> {
                 credentials,
             }))
         }
-        Commands::Install => lifecycle::install(),
-        Commands::Uninstall { purge } => lifecycle::uninstall(purge),
-        Commands::Start => lifecycle::start(),
-        Commands::Stop => lifecycle::stop(),
-        Commands::Restart => lifecycle::restart(),
-        Commands::Status => lifecycle::status(),
-        Commands::AuthToken => {
+        GatewayCommands::Install => lifecycle::install(),
+        GatewayCommands::Uninstall { purge } => lifecycle::uninstall(purge),
+        GatewayCommands::Start => lifecycle::start(),
+        GatewayCommands::Stop => lifecycle::stop(),
+        GatewayCommands::Restart => lifecycle::restart(),
+        GatewayCommands::Status => lifecycle::status(),
+        GatewayCommands::AuthToken => {
             println!("{}", lifecycle::read_gateway_token()?);
             Ok(())
         }
