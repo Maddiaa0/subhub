@@ -1,5 +1,5 @@
 [package]
-name = "sub-manager"
+name = "subhub"
 version = "0.1.0"
 edition = "2024"
 description = "Manage named Claude Code OAuth credentials in the macOS Keychain"

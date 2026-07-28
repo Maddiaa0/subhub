@@ -44,7 +44,7 @@ struct ProxyState {
 pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
     if options.credentials.is_empty() {
         return Err(AppError(
-            "no credentials saved; run `sub-manager add <name>`".into(),
+            "no credentials saved; run `subhub add <name>`".into(),
         ));
     }
     if !(0.0..100.0).contains(&options.reserve_percent) {
@@ -90,14 +90,14 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
     });
 
     let app = Router::new()
-        .route("/_sub-manager/status", axum::routing::get(status))
+        .route("/_subhub/status", axum::routing::get(status))
         .route("/{*path}", any(proxy))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .map_err(|error| AppError(format!("could not listen on {address}: {error}")))?;
 
-    println!("sub-manager proxy listening on http://{address}");
+    println!("subhub proxy listening on http://{address}");
     println!("export ANTHROPIC_BASE_URL=http://{address}");
     println!("export ANTHROPIC_AUTH_TOKEN={client_token}");
     println!("Press Ctrl-C to stop.");
@@ -373,7 +373,7 @@ fn error_response(status: StatusCode, message: &str) -> Response {
         status,
         serde_json::json!({
             "type":"error",
-            "error":{"type":"sub_manager_error","message":message}
+            "error":{"type":"subhub_error","message":message}
         }),
     )
 }

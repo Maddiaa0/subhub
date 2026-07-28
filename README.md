@@ -1,4 +1,4 @@
-# sub-manager
+# subhub
 
 A small macOS CLI for keeping multiple Claude Code OAuth credentials in the
 login Keychain, auditing their subscription usage, and routing Claude Code
@@ -15,14 +15,14 @@ The program requires `claude`, `/usr/bin/security`, and macOS.
 ## Usage
 
 ```text
-sub-manager add <name>
-sub-manager add <name> --force
-sub-manager list
-sub-manager set <name>
-sub-manager audit
-sub-manager audit --json
-sub-manager serve
-sub-manager help
+subhub add <name>
+subhub add <name> --force
+subhub list
+subhub set <name>
+subhub audit
+subhub audit --json
+subhub serve
+subhub help
 ```
 
 `add` runs `claude auth login --claudeai` with the OAuth scopes needed for
@@ -37,13 +37,13 @@ remains active. A duplicate name fails unless `--force` is used.
 the corresponding `oauthAccount` metadata in `~/.claude.json`.
 
 Credentials and their account metadata are stored as separate generic-password
-items under the Keychain service `sub-manager-credentials`. Tokens and account
+items under the Keychain service `subhub-credentials`. Tokens and account
 details are never written to the index.
 The index contains only names and the active name at:
 
-1. `$XDG_CONFIG/.sub-manager/index.json`, if `XDG_CONFIG` is set
-2. `$XDG_CONFIG_HOME/.sub-manager/index.json`, otherwise
-3. `$HOME/.config/.sub-manager/index.json`, otherwise
+1. `$XDG_CONFIG/.subhub/index.json`, if `XDG_CONFIG` is set
+2. `$XDG_CONFIG_HOME/.subhub/index.json`, otherwise
+3. `$HOME/.config/.subhub/index.json`, otherwise
 
 ## Usage audit
 
@@ -52,12 +52,12 @@ credential. It reports the rolling five-hour and seven-day utilization and
 reset times. The saved OAuth token must include the `user:profile` scope.
 
 ```sh
-sub-manager audit
+subhub audit
 ```
 
 This endpoint is currently a beta interface used by Claude tooling. An
 unauthorized or incompatible credential is reported as unavailable; refresh it
-with `sub-manager add <name> --force`.
+with `subhub add <name> --force`.
 
 ## Local credential router
 
@@ -69,7 +69,7 @@ is rejected with `401` or `429` before streaming begins, it can retry once with
 another eligible credential.
 
 ```sh
-sub-manager serve
+subhub serve
 ```
 
 The command prints values to use in the shell where Claude Code will run:
@@ -82,7 +82,7 @@ claude
 
 The local token authenticates Claude Code to the proxy. It is never forwarded
 to Anthropic; the proxy replaces it with the selected saved OAuth token. To use
-a stable local token, set `SUB_MANAGER_CLIENT_TOKEN` before starting the
+a stable local token, set `SUBHUB_CLIENT_TOKEN` before starting the
 server.
 
 The server intentionally refuses non-loopback addresses, does not log request
@@ -90,14 +90,14 @@ or response contents, and defaults to retaining one percent of each applicable
 usage window:
 
 ```sh
-sub-manager serve --reserve-percent 1 --audit-interval 120
+subhub serve --reserve-percent 1 --audit-interval 120
 ```
 
 With the proxy running, its sanitized state is available at:
 
 ```sh
 curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
-  "$ANTHROPIC_BASE_URL/_sub-manager/status"
+  "$ANTHROPIC_BASE_URL/_subhub/status"
 ```
 
 Limitations of this MVP:

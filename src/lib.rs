@@ -15,7 +15,8 @@ mod proxy;
 pub mod usage;
 
 const ACTIVE_SERVICE: &str = "Claude Code-credentials";
-const VAULT_SERVICE: &str = "sub-manager-credentials";
+const VAULT_SERVICE: &str = "subhub-credentials";
+const LEGACY_VAULT_SERVICE: &str = "sub-manager-credentials";
 const CLAUDE_OAUTH_SCOPES_ENV: &str = "CLAUDE_CODE_OAUTH_SCOPES";
 const REQUESTED_OAUTH_SCOPES: [&str; 4] = [
     "user:inference",
@@ -52,7 +53,7 @@ impl From<serde_json::Error> for AppError {
 
 #[derive(Parser)]
 #[command(
-    name = "sub-manager",
+    name = "subhub",
     version,
     about = "Manage named Claude Code subscriptions in the macOS Keychain"
 )]
@@ -90,7 +91,7 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:7842")]
         listen: String,
         /// Secret Claude Code must send as ANTHROPIC_AUTH_TOKEN
-        #[arg(long, env = "SUB_MANAGER_CLIENT_TOKEN")]
+        #[arg(long, env = "SUBHUB_CLIENT_TOKEN")]
         client_token: Option<String>,
         /// Percentage of capacity to keep in reserve
         #[arg(long, default_value_t = 1.0)]
@@ -146,7 +147,7 @@ impl Index {
 
 pub fn run() -> Result<()> {
     if !cfg!(target_os = "macos") {
-        return Err(AppError("sub-manager currently requires macOS".into()));
+        return Err(AppError("subhub currently requires macOS".into()));
     }
 
     dispatch(Cli::parse())
@@ -154,7 +155,7 @@ pub fn run() -> Result<()> {
 
 fn dispatch(cli: Cli) -> Result<()> {
     let path = index_path()?;
-    let mut index = load_index(&path)?;
+    let mut index = load_or_migrate_index(&path, &legacy_index_path()?)?;
 
     match cli.command {
         Commands::Add { name, force } => add(&path, &mut index, &name, force),
@@ -232,7 +233,7 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
 
 fn list(index: &Index) -> Result<()> {
     if index.credentials.is_empty() {
-        println!("No credentials saved. Run `sub-manager add <name>`.");
+        println!("No credentials saved. Run `subhub add <name>`.");
         return Ok(());
     }
 
@@ -251,18 +252,18 @@ fn set(path: &Path, index: &mut Index, name: &str) -> Result<()> {
     validate_name(name)?;
     if !index.contains(name) {
         return Err(AppError(format!(
-            "credential \"{name}\" is not in the index; run `sub-manager list`"
+            "credential \"{name}\" is not in the index; run `subhub list`"
         )));
     }
 
-    let stored = keychain_read(VAULT_SERVICE, name).map_err(|error| {
+    let stored = vault_read(name).map_err(|error| {
         AppError(format!(
             "credential \"{name}\" is indexed but missing from Keychain: {error}"
         ))
     })?;
     let (credential, oauth_account) = decode_vault_entry(&stored).map_err(|error| {
         AppError(format!(
-            "{error}; refresh it with `sub-manager add {name} --force`"
+            "{error}; refresh it with `subhub add {name} --force`"
         ))
     })?;
     validate_credential(&credential)?;
@@ -289,7 +290,7 @@ fn decode_vault_entry(stored: &str) -> Result<(String, Value)> {
 fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
     let mut credentials = Vec::with_capacity(index.credentials.len());
     for name in &index.credentials {
-        let stored = keychain_read(VAULT_SERVICE, name).map_err(|error| {
+        let stored = vault_read(name).map_err(|error| {
             AppError(format!(
                 "credential \"{name}\" is missing from Keychain: {error}"
             ))
@@ -337,7 +338,7 @@ struct AuditResult {
 async fn audit(credentials: Vec<StoredCredential>, json: bool) -> Result<()> {
     if credentials.is_empty() {
         return Err(AppError(
-            "no credentials saved; run `sub-manager add <name>`".into(),
+            "no credentials saved; run `subhub add <name>`".into(),
         ));
     }
     let usage_client = usage::UsageClient::new(reqwest::Client::new(), claude_version().as_deref());
@@ -551,7 +552,7 @@ fn validate_required_scopes(raw: &str) -> Result<()> {
     } else {
         Err(AppError(format!(
             "Claude login did not grant required OAuth scope(s): {}; \
-             update Claude Code and retry `sub-manager add`",
+             update Claude Code and retry `subhub add`",
             missing.join(", ")
         )))
     }
@@ -596,6 +597,19 @@ fn keychain_write(service: &str, account: &str, credential: &str) -> Result<()> 
     Err(AppError(format!("could not update Keychain: {detail}")))
 }
 
+fn vault_read(name: &str) -> Result<String> {
+    match keychain_read(VAULT_SERVICE, name) {
+        Ok(stored) => Ok(stored),
+        Err(current_error) => match keychain_read(LEGACY_VAULT_SERVICE, name) {
+            Ok(stored) => {
+                keychain_write(VAULT_SERVICE, name, &stored)?;
+                Ok(stored)
+            }
+            Err(_) => Err(current_error),
+        },
+    }
+}
+
 fn require_success(status: ExitStatus, message: &str) -> Result<()> {
     if status.success() {
         Ok(())
@@ -611,13 +625,29 @@ fn current_user() -> Result<String> {
         .ok_or_else(|| AppError("USER is not set".into()))
 }
 
-fn index_path() -> Result<PathBuf> {
-    let base = env::var_os("XDG_CONFIG")
+fn config_base_path() -> Result<PathBuf> {
+    env::var_os("XDG_CONFIG")
         .or_else(|| env::var_os("XDG_CONFIG_HOME"))
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .ok_or_else(|| AppError("XDG_CONFIG, XDG_CONFIG_HOME, and HOME are not set".into()))?;
-    Ok(base.join(".sub-manager").join("index.json"))
+        .ok_or_else(|| AppError("XDG_CONFIG, XDG_CONFIG_HOME, and HOME are not set".into()))
+}
+
+fn index_path() -> Result<PathBuf> {
+    Ok(config_base_path()?.join(".subhub").join("index.json"))
+}
+
+fn legacy_index_path() -> Result<PathBuf> {
+    Ok(config_base_path()?.join(".sub-manager").join("index.json"))
+}
+
+fn load_or_migrate_index(path: &Path, legacy_path: &Path) -> Result<Index> {
+    if path.exists() || !legacy_path.exists() {
+        return load_index(path);
+    }
+    let index = load_index(legacy_path)?;
+    save_index(path, &index)?;
+    Ok(index)
 }
 
 fn load_index(path: &Path) -> Result<Index> {
@@ -753,10 +783,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory = env::temp_dir().join(format!(
-            "sub-manager-index-test-{}-{unique}",
-            std::process::id()
-        ));
+        let directory =
+            env::temp_dir().join(format!("subhub-index-test-{}-{unique}", std::process::id()));
         let path = directory.join("index.json");
 
         let mut index = Index::new();
@@ -786,6 +814,30 @@ mod tests {
             );
         }
 
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_index_is_copied_to_subhub_location() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!(
+            "subhub-migration-test-{}-{unique}",
+            std::process::id()
+        ));
+        let legacy_path = directory.join("legacy").join("index.json");
+        let subhub_path = directory.join("subhub").join("index.json");
+        let mut legacy = Index::new();
+        legacy.add("personal");
+        save_index(&legacy_path, &legacy).unwrap();
+
+        let migrated = load_or_migrate_index(&subhub_path, &legacy_path).unwrap();
+
+        assert_eq!(migrated.credentials, ["personal"]);
+        assert_eq!(migrated.active.as_deref(), Some("personal"));
+        assert!(subhub_path.exists());
         fs::remove_dir_all(directory).unwrap();
     }
 }
