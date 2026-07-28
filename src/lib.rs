@@ -219,6 +219,7 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
                 reserve_percent,
                 audit_interval,
                 background,
+                initial_selected: index.active.clone(),
                 credentials,
             }))
         }
@@ -326,6 +327,11 @@ fn set(path: &Path, index: &mut Index, name: &str) -> Result<()> {
     index.active = Some(name.to_owned());
     save_index(path, index)?;
     println!("Active credential set to \"{name}\".");
+    match lifecycle::select_gateway_account(name) {
+        Ok(true) => println!("Running gateway switched to \"{name}\"."),
+        Ok(false) => {}
+        Err(error) => eprintln!("warning: running gateway was not switched: {error}"),
+    }
     Ok(())
 }
 
