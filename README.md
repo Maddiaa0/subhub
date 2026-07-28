@@ -25,7 +25,9 @@ sub-manager serve
 sub-manager help
 ```
 
-`add` runs `claude auth login`, captures the resulting
+`add` runs `claude auth login --claudeai` with the OAuth scopes needed for
+inference, usage auditing, Claude Code sessions, and account MCP servers. It
+validates that Claude granted those scopes, then captures the resulting
 `Claude Code-credentials` Keychain item and Claude account identity metadata,
 and saves them together as a named Keychain entry. The newly added credential
 remains active. A duplicate name fails unless `--force` is used.

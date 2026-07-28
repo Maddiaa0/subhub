@@ -15,6 +15,14 @@ pub mod usage;
 
 const ACTIVE_SERVICE: &str = "Claude Code-credentials";
 const VAULT_SERVICE: &str = "sub-manager-credentials";
+const CLAUDE_OAUTH_SCOPES_ENV: &str = "CLAUDE_CODE_OAUTH_SCOPES";
+const REQUESTED_OAUTH_SCOPES: [&str; 4] = [
+    "user:inference",
+    "user:profile",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+];
+const REQUIRED_OAUTH_SCOPES: [&str; 2] = ["user:inference", "user:profile"];
 
 pub type Result<T> = std::result::Result<T, AppError>;
 
@@ -187,8 +195,10 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
     }
 
     println!("Opening Claude Code login for credential \"{name}\"...");
+    let oauth_scopes = requested_oauth_scopes(env::var_os(CLAUDE_OAUTH_SCOPES_ENV).as_deref());
     let status = Command::new("claude")
-        .args(["auth", "login"])
+        .args(["auth", "login", "--claudeai"])
+        .env(CLAUDE_OAUTH_SCOPES_ENV, oauth_scopes)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -204,6 +214,7 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
         ))
     })?;
     validate_credential(&credential)?;
+    validate_required_scopes(&credential)?;
     let credential_value: Value = serde_json::from_str(&credential)?;
     let oauth_account = read_oauth_account()?;
     let vault_entry = serde_json::to_string(&VaultEntry {
@@ -479,6 +490,54 @@ fn validate_credential(raw: &str) -> Result<()> {
     Ok(())
 }
 
+fn requested_oauth_scopes(existing: Option<&std::ffi::OsStr>) -> String {
+    let mut scopes: Vec<String> = existing
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    for requested in REQUESTED_OAUTH_SCOPES {
+        if !scopes.iter().any(|scope| scope == requested) {
+            scopes.push(requested.to_owned());
+        }
+    }
+    scopes.join(" ")
+}
+
+fn validate_required_scopes(raw: &str) -> Result<()> {
+    let parsed: Value = serde_json::from_str(raw)
+        .map_err(|_| AppError("Keychain credential is not valid JSON".into()))?;
+    let scopes = parsed
+        .get("claudeAiOauth")
+        .and_then(|oauth| oauth.get("scopes"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AppError(
+                "Claude login returned no OAuth scopes; update Claude Code and log in again".into(),
+            )
+        })?;
+    let missing: Vec<&str> = REQUIRED_OAUTH_SCOPES
+        .iter()
+        .copied()
+        .filter(|required| {
+            !scopes
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|scope| scope == *required)
+        })
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError(format!(
+            "Claude login did not grant required OAuth scope(s): {}; \
+             update Claude Code and retry `sub-manager add`",
+            missing.join(", ")
+        )))
+    }
+}
+
 fn keychain_read(service: &str, account: &str) -> Result<String> {
     let output = Command::new("security")
         .args(["find-generic-password", "-s", service, "-a", account, "-w"])
@@ -605,6 +664,39 @@ mod tests {
         let raw = r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r"}}"#;
         assert!(validate_credential(raw).is_ok());
         assert!(validate_credential("{}").is_err());
+    }
+
+    #[test]
+    fn requested_scopes_preserve_extras_and_add_required_scopes() {
+        let scopes =
+            requested_oauth_scopes(Some(std::ffi::OsStr::new("custom:scope user:profile")));
+        assert_eq!(
+            scopes,
+            "custom:scope user:profile user:inference user:sessions:claude_code user:mcp_servers"
+        );
+    }
+
+    #[test]
+    fn required_scope_validation_rejects_inference_only_tokens() {
+        let complete = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "a",
+                "refreshToken": "r",
+                "scopes": REQUESTED_OAUTH_SCOPES
+            }
+        })
+        .to_string();
+        let inference_only = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "a",
+                "refreshToken": "r",
+                "scopes": ["user:inference"]
+            }
+        })
+        .to_string();
+        assert!(validate_required_scopes(&complete).is_ok());
+        let error = validate_required_scopes(&inference_only).unwrap_err();
+        assert!(error.to_string().contains("user:profile"));
     }
 
     #[test]
