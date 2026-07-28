@@ -1,3 +1,4 @@
+use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -405,10 +406,28 @@ fn format_window(window: Option<&usage::UsageWindow>) -> String {
             window
                 .resets_at
                 .as_ref()
-                .map(|reset| format!("{used}, resets {reset}"))
+                .map(|reset| format!("{used}, resets {}", format_reset_time(reset)))
                 .unwrap_or(used)
         }
         None => "not reported".into(),
+    }
+}
+
+fn format_reset_time(reset: &str) -> String {
+    let Ok(parsed) = DateTime::parse_from_rfc3339(reset) else {
+        return reset.to_owned();
+    };
+    let reset_local = parsed.with_timezone(&Local);
+    let today = Local::now().date_naive();
+    let reset_date = reset_local.date_naive();
+    let time = reset_local.format("%-I:%M %p");
+
+    if reset_date == today {
+        format!("today at {time}")
+    } else if reset_date == today.succ_opt().unwrap_or(today) {
+        format!("tomorrow at {time}")
+    } else {
+        reset_local.format("%a %b %-d at %-I:%M %p").to_string()
     }
 }
 
@@ -697,6 +716,15 @@ mod tests {
         assert!(validate_required_scopes(&complete).is_ok());
         let error = validate_required_scopes(&inference_only).unwrap_err();
         assert!(error.to_string().contains("user:profile"));
+    }
+
+    #[test]
+    fn reset_timestamp_is_human_readable() {
+        let formatted = format_reset_time("2030-08-01T13:00:00.118915+00:00");
+        assert!(!formatted.contains("T13:00"));
+        assert!(formatted.contains(" at "));
+        assert!(formatted.ends_with("AM") || formatted.ends_with("PM"));
+        assert_eq!(format_reset_time("unknown"), "unknown");
     }
 
     #[test]
