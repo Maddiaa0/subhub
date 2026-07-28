@@ -10,6 +10,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
+mod proxy;
+pub mod usage;
+
 const ACTIVE_SERVICE: &str = "Claude Code-credentials";
 const VAULT_SERVICE: &str = "sub-manager-credentials";
 
@@ -66,6 +69,27 @@ enum Commands {
         /// Friendly name of the saved credential
         name: String,
     },
+    /// Query subscription usage for every saved credential
+    Audit {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the local credential-routing Anthropic proxy
+    Serve {
+        /// Loopback address to listen on
+        #[arg(long, default_value = "127.0.0.1:7842")]
+        listen: String,
+        /// Secret Claude Code must send as ANTHROPIC_AUTH_TOKEN
+        #[arg(long, env = "SUB_MANAGER_CLIENT_TOKEN")]
+        client_token: Option<String>,
+        /// Percentage of capacity to keep in reserve
+        #[arg(long, default_value_t = 1.0)]
+        reserve_percent: f64,
+        /// Seconds between background usage audits
+        #[arg(long, default_value_t = 120)]
+        audit_interval: u64,
+    },
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -80,6 +104,13 @@ struct VaultEntry {
     credential: Value,
     #[serde(rename = "oauthAccount")]
     oauth_account: Value,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredCredential {
+    pub name: String,
+    pub access_token: String,
+    pub scopes: Vec<String>,
 }
 
 impl Index {
@@ -120,7 +151,31 @@ fn dispatch(cli: Cli) -> Result<()> {
         Commands::Add { name, force } => add(&path, &mut index, &name, force),
         Commands::List => list(&index),
         Commands::Set { name } => set(&path, &mut index, &name),
+        Commands::Audit { json } => {
+            let credentials = stored_credentials(&index)?;
+            runtime()?.block_on(audit(credentials, json))
+        }
+        Commands::Serve {
+            listen,
+            client_token,
+            reserve_percent,
+            audit_interval,
+        } => {
+            let credentials = stored_credentials(&index)?;
+            runtime()?.block_on(proxy::serve(proxy::ServeOptions {
+                listen,
+                client_token,
+                reserve_percent,
+                audit_interval,
+                credentials,
+            }))
+        }
     }
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Runtime::new()
+        .map_err(|error| AppError(format!("could not start async runtime: {error}")))
 }
 
 fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
@@ -217,6 +272,145 @@ fn decode_vault_entry(stored: &str) -> Result<(String, Value)> {
         serde_json::to_string(&entry.credential)?,
         entry.oauth_account,
     ))
+}
+
+fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
+    let mut credentials = Vec::with_capacity(index.credentials.len());
+    for name in &index.credentials {
+        let stored = keychain_read(VAULT_SERVICE, name).map_err(|error| {
+            AppError(format!(
+                "credential \"{name}\" is missing from Keychain: {error}"
+            ))
+        })?;
+        let parsed: Value = serde_json::from_str(&stored)
+            .map_err(|_| AppError(format!("credential \"{name}\" is not valid JSON")))?;
+        let oauth = parsed
+            .get("credential")
+            .and_then(|value| value.get("claudeAiOauth"))
+            .and_then(Value::as_object)
+            .ok_or_else(|| AppError(format!("credential \"{name}\" has no claudeAiOauth")))?;
+        let access_token = oauth
+            .get("accessToken")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError(format!("credential \"{name}\" has no access token")))?;
+        let scopes = oauth
+            .get("scopes")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        credentials.push(StoredCredential {
+            name: name.clone(),
+            access_token: access_token.to_owned(),
+            scopes,
+        });
+    }
+    Ok(credentials)
+}
+
+#[derive(Serialize)]
+struct AuditResult {
+    name: String,
+    status: &'static str,
+    usage: Option<usage::UsageSnapshot>,
+    error: Option<String>,
+}
+
+async fn audit(credentials: Vec<StoredCredential>, json: bool) -> Result<()> {
+    if credentials.is_empty() {
+        return Err(AppError(
+            "no credentials saved; run `sub-manager add <name>`".into(),
+        ));
+    }
+    let usage_client = usage::UsageClient::new(reqwest::Client::new(), claude_version().as_deref());
+    let mut results = Vec::with_capacity(credentials.len());
+    for credential in credentials {
+        let result = if !credential.scopes.is_empty()
+            && !credential
+                .scopes
+                .iter()
+                .any(|scope| scope == "user:profile")
+        {
+            AuditResult {
+                name: credential.name,
+                status: "unavailable",
+                usage: None,
+                error: Some("OAuth token lacks user:profile scope".into()),
+            }
+        } else {
+            match usage_client.fetch(&credential.access_token).await {
+                Ok(usage) => AuditResult {
+                    name: credential.name,
+                    status: "available",
+                    usage: Some(usage),
+                    error: None,
+                },
+                Err(error) => AuditResult {
+                    name: credential.name,
+                    status: "unavailable",
+                    usage: None,
+                    error: Some(error.to_string()),
+                },
+            }
+        };
+        results.push(result);
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    } else {
+        for result in results {
+            match result.usage {
+                Some(usage) => println!(
+                    "{}: 5h {}, 7d {}",
+                    result.name,
+                    format_window(usage.five_hour.as_ref()),
+                    format_window(usage.seven_day.as_ref())
+                ),
+                None => println!(
+                    "{}: unavailable ({})",
+                    result.name,
+                    result.error.unwrap_or_else(|| "unknown error".into())
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn format_window(window: Option<&usage::UsageWindow>) -> String {
+    match window {
+        Some(window) => {
+            let used = window
+                .utilization
+                .map(|value| format!("{value:.1}% used"))
+                .unwrap_or_else(|| "unknown".into());
+            window
+                .resets_at
+                .as_ref()
+                .map(|reset| format!("{used}, resets {reset}"))
+                .unwrap_or(used)
+        }
+        None => "not reported".into(),
+    }
+}
+
+fn claude_version() -> Option<String> {
+    let output = Command::new("claude").arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
 }
 
 fn claude_config_path() -> Result<PathBuf> {
