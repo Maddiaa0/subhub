@@ -2,8 +2,15 @@
 name = "subhub"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Manage named Claude Code OAuth credentials in the macOS Keychain"
 license = "MIT"
+repository = "https://github.com/Maddiaa0/subhub"
+homepage = "https://github.com/Maddiaa0/subhub"
+documentation = "https://docs.rs/subhub"
+readme = "README.md"
+keywords = ["claude", "oauth", "keychain", "subscription", "proxy"]
+categories = ["command-line-utilities", "authentication"]
 
 [dependencies]
 axum = "0.8"

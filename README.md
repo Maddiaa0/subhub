@@ -25,16 +25,18 @@
 
 ## Getting Started
 
-Subhub requires macOS, Rust, and the `claude` CLI.
+Subhub requires macOS, Rust 1.85 or newer, and the `claude` CLI.
 
 ```sh
-cargo install --path .
+cargo install subhub
 
 subhub add personal
 subhub add work
 subhub audit
 subhub gateway install
 ```
+
+To install from a local checkout instead, run `cargo install --path .`.
 
 Installation starts a per-user LaunchAgent and configures Claude Code to use
 the local gateway. It also adds a status-line segment with the active account
