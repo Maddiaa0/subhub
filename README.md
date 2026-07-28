@@ -1,8 +1,8 @@
 # subhub
 
-A small macOS CLI for keeping multiple Claude Code OAuth credentials in the
-login Keychain, auditing their subscription usage, and routing Claude Code
-requests through a credential that has capacity available.
+A small macOS CLI for keeping multiple Claude Code and Codex OAuth credentials
+in the login Keychain, auditing subscription usage, and routing each CLI
+through an account for its provider that has capacity available.
 
 ## Build and install
 
@@ -32,12 +32,18 @@ subhub gateway auth-token
 subhub help
 ```
 
-`add` runs `claude auth login --claudeai` with the OAuth scopes needed for
+`add` prompts for Claude Code or Codex. Claude login runs
+`claude auth login --claudeai` with the OAuth scopes needed for
 inference, usage auditing, Claude Code sessions, and account MCP servers. It
 validates that Claude granted those scopes, then captures the resulting
 `Claude Code-credentials` Keychain item and Claude account identity metadata,
 and saves them together as a named Keychain entry. The newly added credential
 remains active. A duplicate name fails unless `--force` is used.
+
+For Codex, Subhub runs the standard `codex login` ChatGPT flow using a temporary
+file-backed credential cache, stores the resulting cache in Keychain, and
+restores the prior active Codex login. Account names belong to exactly one
+provider.
 
 `set` copies the selected named credential back to the
 `Claude Code-credentials` Keychain item for the current `$USER` and restores
@@ -113,6 +119,8 @@ curl -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
 Limitations of this MVP:
 
 - OAuth refresh remains delegated to Claude Code. Re-add an expired credential.
+- Codex OAuth refresh is not yet performed by the gateway. Re-add an expired
+  Codex subscription.
 - Request bodies are bounded at 32 MiB and buffered before forwarding.
 - Automatic replay occurs only after a pre-stream `401` or `429`; interrupted
   streaming responses are never replayed.
@@ -169,6 +177,13 @@ subhub gateway uninstall
 Installation records the previous `ANTHROPIC_BASE_URL` and `apiKeyHelper`
 values. Uninstall restores them only when their current values still belong to
 Subhub, so subsequent user edits are not overwritten.
+
+Installation also adds a `subhub` Responses API provider to
+`~/.codex/config.toml`, points `model_provider` at it, and uses the same local
+Keychain-backed authentication helper. Codex requests use `/openai` on the
+loopback gateway and are routed only across saved Codex subscriptions.
+Uninstall restores the prior `model_provider` and provider table only if those
+values are still managed by Subhub.
 
 Claude settings containing `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` must
 be cleaned up before installation because those values take precedence over
