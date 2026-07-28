@@ -11,6 +11,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
+mod lifecycle;
 mod proxy;
 pub mod usage;
 
@@ -99,7 +100,28 @@ enum Commands {
         /// Seconds between background usage audits
         #[arg(long, default_value_t = 120)]
         audit_interval: u64,
+        /// Internal LaunchAgent mode
+        #[arg(long, hide = true)]
+        background: bool,
     },
+    /// Install and start the background gateway
+    Install,
+    /// Stop the gateway and remove its Claude integration
+    Uninstall {
+        /// Also remove Subhub credentials, token, and index
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Start the installed background gateway
+    Start,
+    /// Stop the installed background gateway
+    Stop,
+    /// Restart the installed background gateway
+    Restart,
+    /// Show installation, process, and gateway health
+    Status,
+    /// Print the local gateway authentication token
+    AuthToken,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -170,6 +192,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             client_token,
             reserve_percent,
             audit_interval,
+            background,
         } => {
             let credentials = stored_credentials(&index)?;
             runtime()?.block_on(proxy::serve(proxy::ServeOptions {
@@ -177,8 +200,19 @@ fn dispatch(cli: Cli) -> Result<()> {
                 client_token,
                 reserve_percent,
                 audit_interval,
+                background,
                 credentials,
             }))
+        }
+        Commands::Install => lifecycle::install(),
+        Commands::Uninstall { purge } => lifecycle::uninstall(purge),
+        Commands::Start => lifecycle::start(),
+        Commands::Stop => lifecycle::stop(),
+        Commands::Restart => lifecycle::restart(),
+        Commands::Status => lifecycle::status(),
+        Commands::AuthToken => {
+            println!("{}", lifecycle::read_gateway_token()?);
+            Ok(())
         }
     }
 }
@@ -595,6 +629,22 @@ fn keychain_write(service: &str, account: &str, credential: &str) -> Result<()> 
     }
     let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     Err(AppError(format!("could not update Keychain: {detail}")))
+}
+
+fn keychain_delete(service: &str, account: &str) -> Result<()> {
+    let output = Command::new("security")
+        .args(["delete-generic-password", "-s", service, "-a", account])
+        .output()
+        .map_err(|error| AppError(format!("could not run `security`: {error}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(AppError(if detail.is_empty() {
+        "Keychain item was not found".into()
+    } else {
+        detail
+    }))
 }
 
 fn vault_read(name: &str) -> Result<String> {

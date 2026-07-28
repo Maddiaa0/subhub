@@ -22,6 +22,13 @@ subhub set <name>
 subhub audit
 subhub audit --json
 subhub serve
+subhub install
+subhub uninstall
+subhub start
+subhub stop
+subhub restart
+subhub status
+subhub auth-token
 subhub help
 ```
 
@@ -108,3 +115,60 @@ Limitations of this MVP:
   streaming responses are never replayed.
 - Non-message Anthropic endpoints are passed through with the same selected
   credential but have not all been individually characterized.
+
+## Background gateway
+
+After installing the executable, enable the persistent gateway once:
+
+```sh
+cargo install --path .
+subhub install
+```
+
+`install` creates and starts the per-user macOS LaunchAgent
+`com.subhub.gateway`. It also configures Claude Code with the local base URL
+and an absolute API-key helper, so shell profiles and `$PATH` changes are not
+required. The helper and gateway read the same randomly generated local token
+from Keychain. The token is not written to the LaunchAgent, Claude settings,
+or process arguments.
+
+Manage the installed gateway with:
+
+```sh
+subhub status
+subhub stop
+subhub start
+subhub restart
+```
+
+`subhub serve` remains available for foreground debugging. When a persistent
+token exists, it uses that token; otherwise it prints an ephemeral local token.
+
+Remove the background integration while preserving saved accounts:
+
+```sh
+subhub uninstall
+```
+
+Installation records the previous `ANTHROPIC_BASE_URL` and `apiKeyHelper`
+values. Uninstall restores them only when their current values still belong to
+Subhub, so subsequent user edits are not overwritten.
+
+Claude settings containing `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` must
+be cleaned up before installation because those values take precedence over
+the helper. `subhub status` also warns when either variable is inherited from
+the current shell.
+
+To also delete Subhub's indexed credentials, Keychain entries, and gateway
+token:
+
+```sh
+subhub uninstall --purge
+```
+
+`auth-token` prints the local gateway token for diagnostics and should be
+treated as sensitive:
+
+```sh
+subhub auth-token
+```
