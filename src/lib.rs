@@ -1,3 +1,4 @@
+use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,8 +11,20 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
+mod proxy;
+pub mod usage;
+
 const ACTIVE_SERVICE: &str = "Claude Code-credentials";
-const VAULT_SERVICE: &str = "sub-manager-credentials";
+const VAULT_SERVICE: &str = "subhub-credentials";
+const LEGACY_VAULT_SERVICE: &str = "sub-manager-credentials";
+const CLAUDE_OAUTH_SCOPES_ENV: &str = "CLAUDE_CODE_OAUTH_SCOPES";
+const REQUESTED_OAUTH_SCOPES: [&str; 4] = [
+    "user:inference",
+    "user:profile",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+];
+const REQUIRED_OAUTH_SCOPES: [&str; 2] = ["user:inference", "user:profile"];
 
 pub type Result<T> = std::result::Result<T, AppError>;
 
@@ -40,7 +53,7 @@ impl From<serde_json::Error> for AppError {
 
 #[derive(Parser)]
 #[command(
-    name = "sub-manager",
+    name = "subhub",
     version,
     about = "Manage named Claude Code subscriptions in the macOS Keychain"
 )]
@@ -66,6 +79,27 @@ enum Commands {
         /// Friendly name of the saved credential
         name: String,
     },
+    /// Query subscription usage for every saved credential
+    Audit {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the local credential-routing Anthropic proxy
+    Serve {
+        /// Loopback address to listen on
+        #[arg(long, default_value = "127.0.0.1:7842")]
+        listen: String,
+        /// Secret Claude Code must send as ANTHROPIC_AUTH_TOKEN
+        #[arg(long, env = "SUBHUB_CLIENT_TOKEN")]
+        client_token: Option<String>,
+        /// Percentage of capacity to keep in reserve
+        #[arg(long, default_value_t = 1.0)]
+        reserve_percent: f64,
+        /// Seconds between background usage audits
+        #[arg(long, default_value_t = 120)]
+        audit_interval: u64,
+    },
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -80,6 +114,13 @@ struct VaultEntry {
     credential: Value,
     #[serde(rename = "oauthAccount")]
     oauth_account: Value,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredCredential {
+    pub name: String,
+    pub access_token: String,
+    pub scopes: Vec<String>,
 }
 
 impl Index {
@@ -106,7 +147,7 @@ impl Index {
 
 pub fn run() -> Result<()> {
     if !cfg!(target_os = "macos") {
-        return Err(AppError("sub-manager currently requires macOS".into()));
+        return Err(AppError("subhub currently requires macOS".into()));
     }
 
     dispatch(Cli::parse())
@@ -114,13 +155,37 @@ pub fn run() -> Result<()> {
 
 fn dispatch(cli: Cli) -> Result<()> {
     let path = index_path()?;
-    let mut index = load_index(&path)?;
+    let mut index = load_or_migrate_index(&path, &legacy_index_path()?)?;
 
     match cli.command {
         Commands::Add { name, force } => add(&path, &mut index, &name, force),
         Commands::List => list(&index),
         Commands::Set { name } => set(&path, &mut index, &name),
+        Commands::Audit { json } => {
+            let credentials = stored_credentials(&index)?;
+            runtime()?.block_on(audit(credentials, json))
+        }
+        Commands::Serve {
+            listen,
+            client_token,
+            reserve_percent,
+            audit_interval,
+        } => {
+            let credentials = stored_credentials(&index)?;
+            runtime()?.block_on(proxy::serve(proxy::ServeOptions {
+                listen,
+                client_token,
+                reserve_percent,
+                audit_interval,
+                credentials,
+            }))
+        }
     }
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Runtime::new()
+        .map_err(|error| AppError(format!("could not start async runtime: {error}")))
 }
 
 fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
@@ -132,8 +197,10 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
     }
 
     println!("Opening Claude Code login for credential \"{name}\"...");
+    let oauth_scopes = requested_oauth_scopes(env::var_os(CLAUDE_OAUTH_SCOPES_ENV).as_deref());
     let status = Command::new("claude")
-        .args(["auth", "login"])
+        .args(["auth", "login", "--claudeai"])
+        .env(CLAUDE_OAUTH_SCOPES_ENV, oauth_scopes)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -149,6 +216,7 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
         ))
     })?;
     validate_credential(&credential)?;
+    validate_required_scopes(&credential)?;
     let credential_value: Value = serde_json::from_str(&credential)?;
     let oauth_account = read_oauth_account()?;
     let vault_entry = serde_json::to_string(&VaultEntry {
@@ -165,7 +233,7 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
 
 fn list(index: &Index) -> Result<()> {
     if index.credentials.is_empty() {
-        println!("No credentials saved. Run `sub-manager add <name>`.");
+        println!("No credentials saved. Run `subhub add <name>`.");
         return Ok(());
     }
 
@@ -184,18 +252,18 @@ fn set(path: &Path, index: &mut Index, name: &str) -> Result<()> {
     validate_name(name)?;
     if !index.contains(name) {
         return Err(AppError(format!(
-            "credential \"{name}\" is not in the index; run `sub-manager list`"
+            "credential \"{name}\" is not in the index; run `subhub list`"
         )));
     }
 
-    let stored = keychain_read(VAULT_SERVICE, name).map_err(|error| {
+    let stored = vault_read(name).map_err(|error| {
         AppError(format!(
             "credential \"{name}\" is indexed but missing from Keychain: {error}"
         ))
     })?;
     let (credential, oauth_account) = decode_vault_entry(&stored).map_err(|error| {
         AppError(format!(
-            "{error}; refresh it with `sub-manager add {name} --force`"
+            "{error}; refresh it with `subhub add {name} --force`"
         ))
     })?;
     validate_credential(&credential)?;
@@ -217,6 +285,163 @@ fn decode_vault_entry(stored: &str) -> Result<(String, Value)> {
         serde_json::to_string(&entry.credential)?,
         entry.oauth_account,
     ))
+}
+
+fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
+    let mut credentials = Vec::with_capacity(index.credentials.len());
+    for name in &index.credentials {
+        let stored = vault_read(name).map_err(|error| {
+            AppError(format!(
+                "credential \"{name}\" is missing from Keychain: {error}"
+            ))
+        })?;
+        let parsed: Value = serde_json::from_str(&stored)
+            .map_err(|_| AppError(format!("credential \"{name}\" is not valid JSON")))?;
+        let oauth = parsed
+            .get("credential")
+            .and_then(|value| value.get("claudeAiOauth"))
+            .and_then(Value::as_object)
+            .ok_or_else(|| AppError(format!("credential \"{name}\" has no claudeAiOauth")))?;
+        let access_token = oauth
+            .get("accessToken")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError(format!("credential \"{name}\" has no access token")))?;
+        let scopes = oauth
+            .get("scopes")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        credentials.push(StoredCredential {
+            name: name.clone(),
+            access_token: access_token.to_owned(),
+            scopes,
+        });
+    }
+    Ok(credentials)
+}
+
+#[derive(Serialize)]
+struct AuditResult {
+    name: String,
+    status: &'static str,
+    usage: Option<usage::UsageSnapshot>,
+    error: Option<String>,
+}
+
+async fn audit(credentials: Vec<StoredCredential>, json: bool) -> Result<()> {
+    if credentials.is_empty() {
+        return Err(AppError(
+            "no credentials saved; run `subhub add <name>`".into(),
+        ));
+    }
+    let usage_client = usage::UsageClient::new(reqwest::Client::new(), claude_version().as_deref());
+    let mut results = Vec::with_capacity(credentials.len());
+    for credential in credentials {
+        let result = if !credential.scopes.is_empty()
+            && !credential
+                .scopes
+                .iter()
+                .any(|scope| scope == "user:profile")
+        {
+            AuditResult {
+                name: credential.name,
+                status: "unavailable",
+                usage: None,
+                error: Some("OAuth token lacks user:profile scope".into()),
+            }
+        } else {
+            match usage_client.fetch(&credential.access_token).await {
+                Ok(usage) => AuditResult {
+                    name: credential.name,
+                    status: "available",
+                    usage: Some(usage),
+                    error: None,
+                },
+                Err(error) => AuditResult {
+                    name: credential.name,
+                    status: "unavailable",
+                    usage: None,
+                    error: Some(error.to_string()),
+                },
+            }
+        };
+        results.push(result);
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    } else {
+        for result in results {
+            match result.usage {
+                Some(usage) => println!(
+                    "{}: 5h {}, 7d {}",
+                    result.name,
+                    format_window(usage.five_hour.as_ref()),
+                    format_window(usage.seven_day.as_ref())
+                ),
+                None => println!(
+                    "{}: unavailable ({})",
+                    result.name,
+                    result.error.unwrap_or_else(|| "unknown error".into())
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn format_window(window: Option<&usage::UsageWindow>) -> String {
+    match window {
+        Some(window) => {
+            let used = window
+                .utilization
+                .map(|value| format!("{value:.1}% used"))
+                .unwrap_or_else(|| "unknown".into());
+            window
+                .resets_at
+                .as_ref()
+                .map(|reset| format!("{used}, resets {}", format_reset_time(reset)))
+                .unwrap_or(used)
+        }
+        None => "not reported".into(),
+    }
+}
+
+fn format_reset_time(reset: &str) -> String {
+    let Ok(parsed) = DateTime::parse_from_rfc3339(reset) else {
+        return reset.to_owned();
+    };
+    let reset_local = parsed.with_timezone(&Local);
+    let today = Local::now().date_naive();
+    let reset_date = reset_local.date_naive();
+    let time = reset_local.format("%-I:%M %p");
+
+    if reset_date == today {
+        format!("today at {time}")
+    } else if reset_date == today.succ_opt().unwrap_or(today) {
+        format!("tomorrow at {time}")
+    } else {
+        reset_local.format("%a %b %-d at %-I:%M %p").to_string()
+    }
+}
+
+fn claude_version() -> Option<String> {
+    let output = Command::new("claude").arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
 }
 
 fn claude_config_path() -> Result<PathBuf> {
@@ -285,6 +510,54 @@ fn validate_credential(raw: &str) -> Result<()> {
     Ok(())
 }
 
+fn requested_oauth_scopes(existing: Option<&std::ffi::OsStr>) -> String {
+    let mut scopes: Vec<String> = existing
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    for requested in REQUESTED_OAUTH_SCOPES {
+        if !scopes.iter().any(|scope| scope == requested) {
+            scopes.push(requested.to_owned());
+        }
+    }
+    scopes.join(" ")
+}
+
+fn validate_required_scopes(raw: &str) -> Result<()> {
+    let parsed: Value = serde_json::from_str(raw)
+        .map_err(|_| AppError("Keychain credential is not valid JSON".into()))?;
+    let scopes = parsed
+        .get("claudeAiOauth")
+        .and_then(|oauth| oauth.get("scopes"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AppError(
+                "Claude login returned no OAuth scopes; update Claude Code and log in again".into(),
+            )
+        })?;
+    let missing: Vec<&str> = REQUIRED_OAUTH_SCOPES
+        .iter()
+        .copied()
+        .filter(|required| {
+            !scopes
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|scope| scope == *required)
+        })
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError(format!(
+            "Claude login did not grant required OAuth scope(s): {}; \
+             update Claude Code and retry `subhub add`",
+            missing.join(", ")
+        )))
+    }
+}
+
 fn keychain_read(service: &str, account: &str) -> Result<String> {
     let output = Command::new("security")
         .args(["find-generic-password", "-s", service, "-a", account, "-w"])
@@ -324,6 +597,19 @@ fn keychain_write(service: &str, account: &str, credential: &str) -> Result<()> 
     Err(AppError(format!("could not update Keychain: {detail}")))
 }
 
+fn vault_read(name: &str) -> Result<String> {
+    match keychain_read(VAULT_SERVICE, name) {
+        Ok(stored) => Ok(stored),
+        Err(current_error) => match keychain_read(LEGACY_VAULT_SERVICE, name) {
+            Ok(stored) => {
+                keychain_write(VAULT_SERVICE, name, &stored)?;
+                Ok(stored)
+            }
+            Err(_) => Err(current_error),
+        },
+    }
+}
+
 fn require_success(status: ExitStatus, message: &str) -> Result<()> {
     if status.success() {
         Ok(())
@@ -339,13 +625,29 @@ fn current_user() -> Result<String> {
         .ok_or_else(|| AppError("USER is not set".into()))
 }
 
-fn index_path() -> Result<PathBuf> {
-    let base = env::var_os("XDG_CONFIG")
+fn config_base_path() -> Result<PathBuf> {
+    env::var_os("XDG_CONFIG")
         .or_else(|| env::var_os("XDG_CONFIG_HOME"))
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .ok_or_else(|| AppError("XDG_CONFIG, XDG_CONFIG_HOME, and HOME are not set".into()))?;
-    Ok(base.join(".sub-manager").join("index.json"))
+        .ok_or_else(|| AppError("XDG_CONFIG, XDG_CONFIG_HOME, and HOME are not set".into()))
+}
+
+fn index_path() -> Result<PathBuf> {
+    Ok(config_base_path()?.join(".subhub").join("index.json"))
+}
+
+fn legacy_index_path() -> Result<PathBuf> {
+    Ok(config_base_path()?.join(".sub-manager").join("index.json"))
+}
+
+fn load_or_migrate_index(path: &Path, legacy_path: &Path) -> Result<Index> {
+    if path.exists() || !legacy_path.exists() {
+        return load_index(path);
+    }
+    let index = load_index(legacy_path)?;
+    save_index(path, &index)?;
+    Ok(index)
 }
 
 fn load_index(path: &Path) -> Result<Index> {
@@ -414,6 +716,48 @@ mod tests {
     }
 
     #[test]
+    fn requested_scopes_preserve_extras_and_add_required_scopes() {
+        let scopes =
+            requested_oauth_scopes(Some(std::ffi::OsStr::new("custom:scope user:profile")));
+        assert_eq!(
+            scopes,
+            "custom:scope user:profile user:inference user:sessions:claude_code user:mcp_servers"
+        );
+    }
+
+    #[test]
+    fn required_scope_validation_rejects_inference_only_tokens() {
+        let complete = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "a",
+                "refreshToken": "r",
+                "scopes": REQUESTED_OAUTH_SCOPES
+            }
+        })
+        .to_string();
+        let inference_only = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "a",
+                "refreshToken": "r",
+                "scopes": ["user:inference"]
+            }
+        })
+        .to_string();
+        assert!(validate_required_scopes(&complete).is_ok());
+        let error = validate_required_scopes(&inference_only).unwrap_err();
+        assert!(error.to_string().contains("user:profile"));
+    }
+
+    #[test]
+    fn reset_timestamp_is_human_readable() {
+        let formatted = format_reset_time("2030-08-01T13:00:00.118915+00:00");
+        assert!(!formatted.contains("T13:00"));
+        assert!(formatted.contains(" at "));
+        assert!(formatted.ends_with("AM") || formatted.ends_with("PM"));
+        assert_eq!(format_reset_time("unknown"), "unknown");
+    }
+
+    #[test]
     fn vault_entry_round_trips_credential_and_account() {
         let entry = VaultEntry {
             credential: serde_json::json!({
@@ -439,10 +783,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory = env::temp_dir().join(format!(
-            "sub-manager-index-test-{}-{unique}",
-            std::process::id()
-        ));
+        let directory =
+            env::temp_dir().join(format!("subhub-index-test-{}-{unique}", std::process::id()));
         let path = directory.join("index.json");
 
         let mut index = Index::new();
@@ -472,6 +814,30 @@ mod tests {
             );
         }
 
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_index_is_copied_to_subhub_location() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!(
+            "subhub-migration-test-{}-{unique}",
+            std::process::id()
+        ));
+        let legacy_path = directory.join("legacy").join("index.json");
+        let subhub_path = directory.join("subhub").join("index.json");
+        let mut legacy = Index::new();
+        legacy.add("personal");
+        save_index(&legacy_path, &legacy).unwrap();
+
+        let migrated = load_or_migrate_index(&subhub_path, &legacy_path).unwrap();
+
+        assert_eq!(migrated.credentials, ["personal"]);
+        assert_eq!(migrated.active.as_deref(), Some("personal"));
+        assert!(subhub_path.exists());
         fs::remove_dir_all(directory).unwrap();
     }
 }
