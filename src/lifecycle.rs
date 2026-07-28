@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const GATEWAY_SERVICE: &str = "subhub-gateway";
 const GATEWAY_TOKEN_ACCOUNT: &str = "local-client-token";
@@ -29,6 +29,8 @@ struct InstallState {
     binary_path: PathBuf,
     previous_base_url: PreviousValue,
     previous_api_key_helper: PreviousValue,
+    #[serde(default)]
+    previous_status_line: Option<PreviousValue>,
 }
 
 pub(crate) fn read_gateway_token() -> Result<String> {
@@ -61,8 +63,12 @@ pub(crate) fn install() -> Result<()> {
             binary_path: binary_path.clone(),
             previous_base_url: get_nested(&settings, &["env", "ANTHROPIC_BASE_URL"]),
             previous_api_key_helper: get_nested(&settings, &["apiKeyHelper"]),
+            previous_status_line: Some(get_nested(&settings, &["statusLine"])),
         }
     };
+    let previous_status_line = state
+        .previous_status_line
+        .or_else(|| Some(get_nested(&settings, &["statusLine"])));
 
     ensure_gateway_token()?;
     set_nested(
@@ -75,14 +81,25 @@ pub(crate) fn install() -> Result<()> {
         &["apiKeyHelper"],
         Value::String(auth_helper_path()?.to_string_lossy().into_owned()),
     )?;
+    set_nested(
+        &mut settings,
+        &["statusLine"],
+        managed_status_line(
+            previous_status_line
+                .as_ref()
+                .and_then(|previous| previous.value.as_ref()),
+        ),
+    )?;
 
     let current_state = InstallState {
         binary_path: binary_path.clone(),
+        previous_status_line,
         ..state
     };
     save_json_file(&state_path, &current_state)?;
     save_json_file(&settings_path, &settings)?;
     write_auth_helper(&auth_helper_path()?, &binary_path)?;
+    write_statusline_helper(&statusline_helper_path()?, &binary_path)?;
     let agent_path = launch_agent_path()?;
     write_launch_agent(&agent_path, &binary_path)?;
     restart()?;
@@ -120,6 +137,15 @@ pub(crate) fn uninstall(purge: bool) -> Result<()> {
             AppError(format!(
                 "could not remove {}: {error}",
                 helper_path.display()
+            ))
+        })?;
+    }
+    let statusline_path = statusline_helper_path()?;
+    if statusline_path.exists() {
+        fs::remove_file(&statusline_path).map_err(|error| {
+            AppError(format!(
+                "could not remove {}: {error}",
+                statusline_path.display()
             ))
         })?;
     }
@@ -198,7 +224,37 @@ pub(crate) fn status() -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn statusline() -> Result<()> {
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|error| AppError(format!("could not read status-line input: {error}")))?;
+    let previous = previous_statusline_output(&input).unwrap_or_default();
+    let subhub = fetch_gateway_status()
+        .map(|status| format_statusline_segment(&status))
+        .unwrap_or_else(|_| "Subhub: unavailable".into());
+
+    let previous = previous.trim_end();
+    if previous.is_empty() {
+        println!("{subhub}");
+    } else if previous.contains('\n') {
+        println!("{previous}");
+        println!("{subhub}");
+    } else {
+        println!("{previous} | {subhub}");
+    }
+    Ok(())
+}
+
 fn gateway_health() -> Result<Option<String>> {
+    let body = fetch_gateway_status()?;
+    Ok(body
+        .get("selected")
+        .and_then(Value::as_str)
+        .map(str::to_owned))
+}
+
+fn fetch_gateway_status() -> Result<Value> {
     let token = read_gateway_token()?;
     crate::runtime()?.block_on(async move {
         let response = reqwest::Client::new()
@@ -211,15 +267,76 @@ fn gateway_health() -> Result<Option<String>> {
         if !response.status().is_success() {
             return Err(AppError(format!("HTTP {}", response.status())));
         }
-        let body: Value = response
+        response
             .json()
             .await
-            .map_err(|error| AppError(error.to_string()))?;
-        Ok(body
-            .get("selected")
-            .and_then(Value::as_str)
-            .map(str::to_owned))
+            .map_err(|error| AppError(error.to_string()))
     })
+}
+
+fn format_statusline_segment(status: &Value) -> String {
+    let Some(selected) = status.get("selected").and_then(Value::as_str) else {
+        return "Subhub: auditing".into();
+    };
+    let usage = status
+        .get("credentials")
+        .and_then(|credentials| credentials.get(selected))
+        .and_then(|credential| credential.get("usage"));
+    let five = usage
+        .and_then(|usage| usage.get("five_hour"))
+        .and_then(|window| window.get("utilization"))
+        .and_then(Value::as_f64);
+    let seven = usage
+        .and_then(|usage| usage.get("seven_day"))
+        .and_then(|window| window.get("utilization"))
+        .and_then(Value::as_f64);
+
+    let mut parts = vec![format!("Subhub: {selected}")];
+    if let Some(five) = five {
+        parts.push(format!("5h {five:.0}%"));
+    }
+    if let Some(seven) = seven {
+        parts.push(format!("7d {seven:.0}%"));
+    }
+    parts.join(" | ")
+}
+
+fn previous_statusline_output(input: &str) -> Result<String> {
+    let state_path = install_state_path()?;
+    if !state_path.exists() {
+        return Ok(String::new());
+    }
+    let state = read_install_state(&state_path)?;
+    let Some(command) = state
+        .previous_status_line
+        .as_ref()
+        .and_then(|previous| previous.value.as_ref())
+        .and_then(|status_line| status_line.get("command"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(String::new());
+    };
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", command])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| AppError(format!("could not run previous status line: {error}")))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| AppError("previous status line has no stdin".into()))?
+        .write_all(input.as_bytes())?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| AppError(format!("previous status line failed: {error}")))?;
+    if output.status.success() {
+        String::from_utf8(output.stdout)
+            .map_err(|_| AppError("previous status line returned non-UTF-8 output".into()))
+    } else {
+        Ok(String::new())
+    }
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -260,6 +377,14 @@ fn restore_claude_settings(state: &InstallState) -> Result<()> {
         &managed_helper,
         &state.previous_api_key_helper,
     );
+    if let Some(previous) = &state.previous_status_line {
+        restore_nested_if_managed(
+            &mut settings,
+            &["statusLine"],
+            &managed_status_line(previous.value.as_ref()),
+            previous,
+        );
+    }
     remove_empty_env(&mut settings);
     save_json_file(&path, &settings)
 }
@@ -276,6 +401,13 @@ fn auth_helper_path() -> Result<PathBuf> {
         .parent()
         .expect("index path has a parent")
         .join("auth-token"))
+}
+
+fn statusline_helper_path() -> Result<PathBuf> {
+    Ok(index_path()?
+        .parent()
+        .expect("index path has a parent")
+        .join("statusline"))
 }
 
 fn claude_settings_path() -> Result<PathBuf> {
@@ -355,6 +487,50 @@ fn write_auth_helper(path: &Path, binary: &Path) -> Result<()> {
     file.sync_all()?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
+}
+
+fn write_statusline_helper(path: &Path, binary: &Path) -> Result<()> {
+    write_executable_helper(
+        path,
+        &format!(
+            "#!/bin/sh\nexec {} gateway statusline\n",
+            shell_quote(binary)
+        ),
+    )
+}
+
+fn write_executable_helper(path: &Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError("helper path has no parent".into()))?;
+    fs::create_dir_all(parent)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o700);
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn managed_status_line(previous: Option<&Value>) -> Value {
+    let mut managed = Map::new();
+    managed.insert("type".into(), Value::String("command".into()));
+    managed.insert(
+        "command".into(),
+        Value::String(statusline_helper_path().map_or_else(
+            |_| "subhub gateway statusline".into(),
+            |path| shell_quote(&path),
+        )),
+    );
+    if let Some(previous) = previous.and_then(Value::as_object) {
+        for key in ["padding", "refreshInterval", "hideVimModeIndicator"] {
+            if let Some(value) = previous.get(key) {
+                managed.insert(key.into(), value.clone());
+            }
+        }
+    }
+    Value::Object(managed)
 }
 
 fn ensure_no_conflicting_claude_credentials(settings: &Value) -> Result<()> {
@@ -541,10 +717,15 @@ mod tests {
                 "KEEP": "yes"
             },
             "apiKeyHelper": "old-helper",
+            "statusLine": {
+                "type": "command",
+                "command": "old-status"
+            },
             "theme": "dark"
         });
         let previous_base = get_nested(&settings, &["env", "ANTHROPIC_BASE_URL"]);
         let previous_helper = get_nested(&settings, &["apiKeyHelper"]);
+        let previous_status = get_nested(&settings, &["statusLine"]);
         set_nested(
             &mut settings,
             &["env", "ANTHROPIC_BASE_URL"],
@@ -555,6 +736,12 @@ mod tests {
             &mut settings,
             &["apiKeyHelper"],
             Value::String("'subhub' auth-token".into()),
+        )
+        .unwrap();
+        set_nested(
+            &mut settings,
+            &["statusLine"],
+            managed_status_line(previous_status.value.as_ref()),
         )
         .unwrap();
         restore_nested_if_managed(
@@ -569,9 +756,16 @@ mod tests {
             &Value::String("'subhub' auth-token".into()),
             &previous_helper,
         );
+        restore_nested_if_managed(
+            &mut settings,
+            &["statusLine"],
+            &managed_status_line(previous_status.value.as_ref()),
+            &previous_status,
+        );
         assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], "https://old.example");
         assert_eq!(settings["env"]["KEEP"], "yes");
         assert_eq!(settings["apiKeyHelper"], "old-helper");
+        assert_eq!(settings["statusLine"]["command"], "old-status");
         assert_eq!(settings["theme"], "dark");
     }
 
@@ -626,13 +820,16 @@ mod tests {
         ));
         let agent = directory.join("agent.plist");
         let helper = directory.join("auth-token");
+        let statusline = directory.join("statusline");
         let binary = Path::new("/Applications/Sub Hub/subhub");
 
         write_launch_agent(&agent, binary).unwrap();
         write_auth_helper(&helper, binary).unwrap();
+        write_statusline_helper(&statusline, binary).unwrap();
 
         let agent_contents = fs::read_to_string(&agent).unwrap();
         let helper_contents = fs::read_to_string(&helper).unwrap();
+        let statusline_contents = fs::read_to_string(&statusline).unwrap();
         assert!(agent_contents.contains("<string>gateway</string>"));
         assert!(agent_contents.contains("<string>--background</string>"));
         assert!(!agent_contents.contains("local-client-token"));
@@ -641,9 +838,53 @@ mod tests {
             "#!/bin/sh\nexec '/Applications/Sub Hub/subhub' gateway auth-token\n"
         );
         assert_eq!(
+            statusline_contents,
+            "#!/bin/sh\nexec '/Applications/Sub Hub/subhub' gateway statusline\n"
+        );
+        assert_eq!(
             fs::metadata(&helper).unwrap().permissions().mode() & 0o777,
             0o700
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn statusline_segment_shows_selected_account_and_usage() {
+        let status = serde_json::json!({
+            "selected": "personal",
+            "credentials": {
+                "personal": {
+                    "usage": {
+                        "five_hour": {"utilization": 12.4},
+                        "seven_day": {"utilization": 34.6}
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            format_statusline_segment(&status),
+            "Subhub: personal | 5h 12% | 7d 35%"
+        );
+        assert_eq!(
+            format_statusline_segment(&serde_json::json!({"selected": null})),
+            "Subhub: auditing"
+        );
+    }
+
+    #[test]
+    fn managed_statusline_preserves_display_options() {
+        let previous = serde_json::json!({
+            "type": "command",
+            "command": "old-status",
+            "padding": 2,
+            "refreshInterval": 10,
+            "hideVimModeIndicator": true
+        });
+        let managed = managed_status_line(Some(&previous));
+        assert_eq!(managed["type"], "command");
+        assert_eq!(managed["padding"], 2);
+        assert_eq!(managed["refreshInterval"], 10);
+        assert_eq!(managed["hideVimModeIndicator"], true);
+        assert_ne!(managed["command"], "old-status");
     }
 }

@@ -131,6 +131,9 @@ enum GatewayCommands {
     Status,
     /// Print the local gateway authentication token
     AuthToken,
+    /// Internal Claude Code status-line renderer
+    #[command(hide = true)]
+    Statusline,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -229,6 +232,7 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
             println!("{}", lifecycle::read_gateway_token()?);
             Ok(())
         }
+        GatewayCommands::Statusline => lifecycle::statusline(),
     }
 }
 

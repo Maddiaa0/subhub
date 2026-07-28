@@ -132,6 +132,18 @@ required. The helper and gateway read the same randomly generated local token
 from Keychain. The token is not written to the LaunchAgent, Claude settings,
 or process arguments.
 
+Installation also adds a Claude Code status-line segment showing the selected
+account and its cached five-hour and seven-day utilization:
+
+```text
+Subhub: personal | 5h 12% | 7d 35%
+```
+
+If a custom status line already exists, Subhub runs it with the original
+Claude session JSON and appends its segment. Display options such as padding
+and refresh interval are retained. Uninstall restores the original status-line
+configuration, provided it has not subsequently been changed by the user.
+
 Manage the installed gateway with:
 
 ```sh
