@@ -41,7 +41,10 @@ remains active. A duplicate name fails unless `--force` is used.
 
 `set` copies the selected named credential back to the
 `Claude Code-credentials` Keychain item for the current `$USER` and restores
-the corresponding `oauthAccount` metadata in `~/.claude.json`.
+the corresponding `oauthAccount` metadata in `~/.claude.json`. When the
+gateway is running, `set` also switches it immediately through its authenticated
+loopback control endpoint. The saved active name becomes the gateway's initial
+selection after later starts and restarts.
 
 Credentials and their account metadata are stored as separate generic-password
 items under the Keychain service `subhub-credentials`. Tokens and account

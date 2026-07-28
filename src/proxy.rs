@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::any;
 use rand::distr::{Alphanumeric, SampleString};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,6 +22,7 @@ pub(crate) struct ServeOptions {
     pub reserve_percent: f64,
     pub audit_interval: u64,
     pub background: bool,
+    pub initial_selected: Option<String>,
     pub credentials: Vec<StoredCredential>,
 }
 
@@ -78,12 +79,18 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| AppError(format!("could not build HTTP client: {error}")))?;
+    let initial_selected = options.initial_selected.filter(|name| {
+        options
+            .credentials
+            .iter()
+            .any(|credential| credential.name == *name)
+    });
     let state = ProxyState {
         usage_client: UsageClient::new(client.clone(), claude_version().as_deref()),
         client,
         credentials: Arc::new(options.credentials),
         health: Arc::default(),
-        selected: Arc::default(),
+        selected: Arc::new(Mutex::new(initial_selected)),
         client_token: Arc::new(client_token.clone()),
         reserve_percent: options.reserve_percent,
     };
@@ -99,6 +106,7 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
 
     let app = Router::new()
         .route("/_subhub/status", axum::routing::get(status))
+        .route("/_subhub/select", axum::routing::post(select_account))
         .route("/{*path}", any(proxy))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(address)
@@ -117,6 +125,43 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         })
         .await
         .map_err(|error| AppError(format!("proxy server failed: {error}")))
+}
+
+#[derive(Deserialize)]
+struct SelectAccountRequest {
+    name: String,
+}
+
+async fn select_account(
+    State(state): State<ProxyState>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<SelectAccountRequest>,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "invalid local proxy token");
+    }
+    if !set_selected_account(&state, &request.name).await {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "credential is not available to the gateway",
+        );
+    }
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({"selected": request.name}),
+    )
+}
+
+async fn set_selected_account(state: &ProxyState, name: &str) -> bool {
+    if !state
+        .credentials
+        .iter()
+        .any(|credential| credential.name == name)
+    {
+        return false;
+    }
+    *state.selected.lock().await = Some(name.to_owned());
+    true
 }
 
 async fn audit_all(state: &ProxyState) {
@@ -463,6 +508,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(selected_again.name, "ready");
+    }
+
+    #[tokio::test]
+    async fn manual_selection_updates_known_account_only() {
+        let state = test_state();
+        assert!(set_selected_account(&state, "ready").await);
+        assert_eq!(state.selected.lock().await.as_deref(), Some("ready"));
+        assert!(!set_selected_account(&state, "missing").await);
+        assert_eq!(state.selected.lock().await.as_deref(), Some("ready"));
     }
 
     #[test]
