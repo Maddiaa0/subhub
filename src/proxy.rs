@@ -1,3 +1,4 @@
+use crate::lifecycle;
 use crate::usage::{UsageClient, UsageSnapshot};
 use crate::{AppError, Result, StoredCredential, claude_version};
 use axum::Router;
@@ -20,6 +21,7 @@ pub(crate) struct ServeOptions {
     pub client_token: Option<String>,
     pub reserve_percent: f64,
     pub audit_interval: u64,
+    pub background: bool,
     pub credentials: Vec<StoredCredential>,
 }
 
@@ -60,9 +62,18 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         ));
     }
 
-    let client_token = options
+    let client_token = match options
         .client_token
-        .unwrap_or_else(|| Alphanumeric.sample_string(&mut rand::rng(), 32));
+        .or_else(|| lifecycle::read_gateway_token().ok())
+    {
+        Some(token) => token,
+        None if options.background => {
+            return Err(AppError(
+                "background gateway token is missing; run `subhub gateway install` again".into(),
+            ));
+        }
+        None => Alphanumeric.sample_string(&mut rand::rng(), 32),
+    };
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -76,13 +87,10 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         client_token: Arc::new(client_token.clone()),
         reserve_percent: options.reserve_percent,
     };
-    audit_all(&state).await;
-
     let audit_state = state.clone();
     let interval = options.audit_interval.max(30);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval));
-        ticker.tick().await;
         loop {
             ticker.tick().await;
             audit_all(&audit_state).await;
@@ -97,10 +105,12 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         .await
         .map_err(|error| AppError(format!("could not listen on {address}: {error}")))?;
 
-    println!("subhub proxy listening on http://{address}");
-    println!("export ANTHROPIC_BASE_URL=http://{address}");
-    println!("export ANTHROPIC_AUTH_TOKEN={client_token}");
-    println!("Press Ctrl-C to stop.");
+    if !options.background {
+        println!("subhub proxy listening on http://{address}");
+        println!("export ANTHROPIC_BASE_URL=http://{address}");
+        println!("export ANTHROPIC_AUTH_TOKEN={client_token}");
+        println!("Press Ctrl-C to stop.");
+    }
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

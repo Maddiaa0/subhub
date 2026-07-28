@@ -11,6 +11,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
+mod lifecycle;
 mod proxy;
 pub mod usage;
 
@@ -85,6 +86,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Manage the local Anthropic credential gateway
+    Gateway {
+        #[command(subcommand)]
+        command: GatewayCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum GatewayCommands {
     /// Run the local credential-routing Anthropic proxy
     Serve {
         /// Loopback address to listen on
@@ -99,7 +109,31 @@ enum Commands {
         /// Seconds between background usage audits
         #[arg(long, default_value_t = 120)]
         audit_interval: u64,
+        /// Internal LaunchAgent mode
+        #[arg(long, hide = true)]
+        background: bool,
     },
+    /// Install and start the background gateway
+    Install,
+    /// Stop the gateway and remove its Claude integration
+    Uninstall {
+        /// Also remove Subhub credentials, token, and index
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Start the installed background gateway
+    Start,
+    /// Stop the installed background gateway
+    Stop,
+    /// Restart the installed background gateway
+    Restart,
+    /// Show installation, process, and gateway health
+    Status,
+    /// Print the local gateway authentication token
+    AuthToken,
+    /// Internal Claude Code status-line renderer
+    #[command(hide = true)]
+    Statusline,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -165,21 +199,40 @@ fn dispatch(cli: Cli) -> Result<()> {
             let credentials = stored_credentials(&index)?;
             runtime()?.block_on(audit(credentials, json))
         }
-        Commands::Serve {
+        Commands::Gateway { command } => dispatch_gateway(command, &index),
+    }
+}
+
+fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
+    match command {
+        GatewayCommands::Serve {
             listen,
             client_token,
             reserve_percent,
             audit_interval,
+            background,
         } => {
-            let credentials = stored_credentials(&index)?;
+            let credentials = stored_credentials(index)?;
             runtime()?.block_on(proxy::serve(proxy::ServeOptions {
                 listen,
                 client_token,
                 reserve_percent,
                 audit_interval,
+                background,
                 credentials,
             }))
         }
+        GatewayCommands::Install => lifecycle::install(),
+        GatewayCommands::Uninstall { purge } => lifecycle::uninstall(purge),
+        GatewayCommands::Start => lifecycle::start(),
+        GatewayCommands::Stop => lifecycle::stop(),
+        GatewayCommands::Restart => lifecycle::restart(),
+        GatewayCommands::Status => lifecycle::status(),
+        GatewayCommands::AuthToken => {
+            println!("{}", lifecycle::read_gateway_token()?);
+            Ok(())
+        }
+        GatewayCommands::Statusline => lifecycle::statusline(),
     }
 }
 
@@ -595,6 +648,22 @@ fn keychain_write(service: &str, account: &str, credential: &str) -> Result<()> 
     }
     let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     Err(AppError(format!("could not update Keychain: {detail}")))
+}
+
+fn keychain_delete(service: &str, account: &str) -> Result<()> {
+    let output = Command::new("security")
+        .args(["delete-generic-password", "-s", service, "-a", account])
+        .output()
+        .map_err(|error| AppError(format!("could not run `security`: {error}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(AppError(if detail.is_empty() {
+        "Keychain item was not found".into()
+    } else {
+        detail
+    }))
 }
 
 fn vault_read(name: &str) -> Result<String> {

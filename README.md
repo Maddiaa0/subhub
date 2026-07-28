@@ -21,7 +21,14 @@ subhub list
 subhub set <name>
 subhub audit
 subhub audit --json
-subhub serve
+subhub gateway serve
+subhub gateway install
+subhub gateway uninstall
+subhub gateway start
+subhub gateway stop
+subhub gateway restart
+subhub gateway status
+subhub gateway auth-token
 subhub help
 ```
 
@@ -69,7 +76,7 @@ is rejected with `401` or `429` before streaming begins, it can retry once with
 another eligible credential.
 
 ```sh
-subhub serve
+subhub gateway serve
 ```
 
 The command prints values to use in the shell where Claude Code will run:
@@ -90,7 +97,7 @@ or response contents, and defaults to retaining one percent of each applicable
 usage window:
 
 ```sh
-subhub serve --reserve-percent 1 --audit-interval 120
+subhub gateway serve --reserve-percent 1 --audit-interval 120
 ```
 
 With the proxy running, its sanitized state is available at:
@@ -108,3 +115,73 @@ Limitations of this MVP:
   streaming responses are never replayed.
 - Non-message Anthropic endpoints are passed through with the same selected
   credential but have not all been individually characterized.
+
+## Background gateway
+
+After installing the executable, enable the persistent gateway once:
+
+```sh
+cargo install --path .
+subhub gateway install
+```
+
+`install` creates and starts the per-user macOS LaunchAgent
+`com.subhub.gateway`. It also configures Claude Code with the local base URL
+and an absolute API-key helper, so shell profiles and `$PATH` changes are not
+required. The helper and gateway read the same randomly generated local token
+from Keychain. The token is not written to the LaunchAgent, Claude settings,
+or process arguments.
+
+Installation also adds a Claude Code status-line segment showing the selected
+account and its cached five-hour and seven-day utilization:
+
+```text
+Subhub: personal | 5h 12% | 7d 35%
+```
+
+If a custom status line already exists, Subhub runs it with the original
+Claude session JSON and appends its segment. Display options such as padding
+and refresh interval are retained. Uninstall restores the original status-line
+configuration, provided it has not subsequently been changed by the user.
+
+Manage the installed gateway with:
+
+```sh
+subhub gateway status
+subhub gateway stop
+subhub gateway start
+subhub gateway restart
+```
+
+`subhub gateway serve` remains available for foreground debugging. When a
+persistent token exists, it uses that token; otherwise it prints an ephemeral
+local token.
+
+Remove the background integration while preserving saved accounts:
+
+```sh
+subhub gateway uninstall
+```
+
+Installation records the previous `ANTHROPIC_BASE_URL` and `apiKeyHelper`
+values. Uninstall restores them only when their current values still belong to
+Subhub, so subsequent user edits are not overwritten.
+
+Claude settings containing `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` must
+be cleaned up before installation because those values take precedence over
+the helper. `subhub gateway status` also warns when either variable is
+inherited from the current shell.
+
+To also delete Subhub's indexed credentials, Keychain entries, and gateway
+token:
+
+```sh
+subhub gateway uninstall --purge
+```
+
+`auth-token` prints the local gateway token for diagnostics and should be
+treated as sensitive:
+
+```sh
+subhub gateway auth-token
+```
