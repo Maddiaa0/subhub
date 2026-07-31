@@ -1,31 +1,23 @@
 # Subhub
 
-<h4 align="center">
-  Keep Claude Code running across multiple subscriptions.
-</h4>
+Keep Claude Code and Codex running across multiple subscriptions.
 
-<p align="center">
-  Store OAuth credentials in the macOS Keychain, track usage, and route Claude Code to an account with capacity.
-</p>
-
-<p align="center">
-  <a href="#features">Features</a> •
-  <a href="#getting-started">Getting Started</a> •
-  <a href="#commands">Commands</a> •
-  <a href="#how-it-works">How It Works</a>
-</p>
+Subhub stores OAuth credentials in the macOS Keychain, reports subscription
+usage, and routes both CLIs through an account for the appropriate provider
+that still has capacity.
 
 ## Features
 
-- **Multiple accounts** — save Claude Code subscriptions under friendly names.
-- **Usage visibility** — view current utilization and reset times across every account.
-- **Automatic routing** — keep session affinity while an account has capacity, then switch when needed.
-- **Background service** — install once and use Claude Code normally.
-- **Keychain storage** — keep credentials and the gateway token out of config files and process arguments.
+- Multiple named Claude Code and Codex accounts.
+- Usage visibility and capacity-aware routing.
+- Session affinity with one safe retry after pre-stream `401` or `429` errors.
+- A persistent, per-user macOS LaunchAgent.
+- Keychain-backed credential and local gateway-token storage.
 
-## Getting Started
+## Getting started
 
-Subhub requires macOS, Rust 1.85 or newer, and the `claude` CLI.
+Subhub requires macOS, Rust 1.85 or newer, and the `claude` and `codex` CLIs
+for their respective providers.
 
 ```sh
 cargo install subhub
@@ -36,65 +28,79 @@ subhub audit
 subhub gateway install
 ```
 
-To install from a local checkout instead, run `cargo install --path .`.
+To install from a local checkout, run `cargo install --path .`.
 
-Installation starts a per-user LaunchAgent and configures Claude Code to use
-the local gateway. It also adds a status-line segment with the active account
-and its cached usage.
-
-```text
-Subhub: personal | 5h 12% | 7d 35%
-```
+`subhub add` prompts for Claude Code or Codex. Claude accounts are captured
+after the standard `claude auth login --claudeai` flow. Codex accounts are
+captured after a standard `codex login` ChatGPT flow in an isolated temporary
+credential cache. Tokens are stored in the macOS login Keychain and are never
+written to the Subhub index.
 
 ## Commands
 
 ```text
 subhub add <name> [--force]       Save or replace an account
-subhub list                       List saved accounts
+subhub list                       List accounts and their providers
 subhub set <name>                 Select an account
 subhub audit [--json]             Show subscription usage
 
 subhub gateway install            Install and start the background gateway
-subhub gateway reinstall          Run uninstall then install in one command
+subhub gateway reinstall          Uninstall then install, preserving accounts
 subhub gateway status             Show gateway health
 subhub gateway start|stop|restart Manage the gateway
 subhub gateway uninstall [--purge]
+subhub gateway serve              Run the gateway in the foreground
+subhub gateway auth-token         Print the local gateway token
 ```
 
-Run `subhub help` or `subhub <command> --help` for all options.
+## How it works
 
-## How It Works
+The authenticated gateway listens only on `127.0.0.1:7842`. It audits account
+capacity every two minutes and keeps using the selected credential while it is
+available. A pre-stream `401` or `429` may be retried once with another eligible
+credential; interrupted streams are never replayed.
 
-Subhub stores OAuth credentials in the macOS login Keychain. Its authenticated
-gateway listens only on `127.0.0.1:7842`, audits account capacity every two
-minutes, and preserves the selected account while it remains available.
-Pre-stream `401` and `429` responses may be retried once with another eligible
-account; interrupted streams are never replayed.
+Claude Code requests are forwarded to Anthropic using saved Claude accounts.
+Codex Responses API requests arrive under `/openai` and are forwarded to the
+Codex upstream using saved Codex accounts. Provider selection is isolated, so
+credentials are never routed across subscription types.
 
-The local gateway token is replaced with the selected OAuth token before a
-request is forwarded. Subhub does not log request or response contents.
-
-Use the foreground server for debugging:
+The foreground server prints the environment needed by Claude Code:
 
 ```sh
 subhub gateway serve
+export ANTHROPIC_BASE_URL=http://127.0.0.1:7842
+export ANTHROPIC_AUTH_TOKEN=<the-local-token-printed-by-serve>
+claude
 ```
 
-To remove the integration but keep saved accounts:
+The local token authenticates clients to Subhub and is never forwarded
+upstream. The gateway does not log request or response contents.
 
-```sh
-subhub gateway uninstall
-```
+## Background integration
 
-If restarting does not recover the gateway, run:
+`subhub gateway install` creates and starts the per-user LaunchAgent
+`com.subhub.gateway`. It configures Claude Code with the local Anthropic base
+URL and a Keychain-backed authentication helper. It also adds a status-line
+segment showing the routed Claude account and cached usage.
+
+For Codex, installation adds a `subhub` Responses API provider to
+`~/.codex/config.toml`, points `model_provider` at it, and configures the same
+local authentication helper. Uninstall restores the prior Claude and Codex
+settings when their current values are still managed by Subhub.
+
+If the service needs to be rebuilt, run:
 
 ```sh
 subhub gateway reinstall
 ```
 
-This runs `subhub gateway uninstall` followed by `subhub gateway install` in a
-single command. It does not purge saved account credentials.
+This preserves saved subscriptions. To remove the integration and all Subhub
+credentials, its gateway token, and its local index, run:
 
-Add `--purge` to also delete Subhub credentials, its gateway token, and its
-local index. OAuth refresh is delegated to Claude Code; re-add an expired
-account with `subhub add <name> --force`.
+```sh
+subhub gateway uninstall --purge
+```
+
+OAuth refresh remains delegated to the provider CLIs. Re-add an expired account
+with `subhub add <name> --force`.

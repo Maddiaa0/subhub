@@ -1,6 +1,6 @@
 use crate::lifecycle;
 use crate::usage::{UsageClient, UsageSnapshot};
-use crate::{AppError, Result, StoredCredential, claude_version};
+use crate::{AppError, Provider, Result, StoredCredential, claude_version, codex};
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
@@ -26,11 +26,33 @@ pub(crate) struct ServeOptions {
     pub credentials: Vec<StoredCredential>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct CredentialHealth {
-    usage: Option<UsageSnapshot>,
+    usage: Option<CredentialUsage>,
     error: Option<String>,
     checked_at: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum CredentialUsage {
+    Claude(UsageSnapshot),
+    Codex(codex::UsageSnapshot),
+}
+
+impl CredentialUsage {
+    fn eligible(&self, model: Option<&str>, reserve: f64) -> bool {
+        match self {
+            Self::Claude(usage) => usage.eligible(model, reserve),
+            Self::Codex(usage) => usage.eligible(reserve),
+        }
+    }
+    fn utilization(&self, model: Option<&str>) -> f64 {
+        match self {
+            Self::Claude(usage) => usage.tightest_utilization(model).unwrap_or(0.0),
+            Self::Codex(usage) => usage.tightest_utilization(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -166,7 +188,16 @@ async fn set_selected_account(state: &ProxyState, name: &str) -> bool {
 
 async fn audit_all(state: &ProxyState) {
     for credential in state.credentials.iter() {
-        let result = if !credential.scopes.is_empty()
+        let result = if credential.provider == Provider::Codex {
+            match credential.account_id.as_deref() {
+                Some(account) => {
+                    codex::fetch_usage(&state.client, &credential.access_token, account)
+                        .await
+                        .map(CredentialUsage::Codex)
+                }
+                None => Err(AppError("Codex credential has no account id".into())),
+            }
+        } else if !credential.scopes.is_empty()
             && !credential
                 .scopes
                 .iter()
@@ -174,25 +205,41 @@ async fn audit_all(state: &ProxyState) {
         {
             Err(AppError("OAuth token lacks user:profile scope".into()))
         } else {
-            state.usage_client.fetch(&credential.access_token).await
+            state
+                .usage_client
+                .fetch(&credential.access_token)
+                .await
+                .map(CredentialUsage::Claude)
         };
-        let health = match result {
-            Ok(usage) => CredentialHealth {
-                usage: Some(usage),
-                error: None,
-                checked_at: now(),
-            },
-            Err(error) => CredentialHealth {
-                usage: None,
-                error: Some(error.to_string()),
-                checked_at: now(),
-            },
-        };
-        state
-            .health
-            .write()
-            .await
-            .insert(credential.name.clone(), health);
+        let mut health = state.health.write().await;
+        let previous_usage = health
+            .get(&credential.name)
+            .and_then(|entry| entry.usage.clone());
+        health.insert(
+            credential.name.clone(),
+            audit_health(previous_usage, result),
+        );
+    }
+}
+
+fn audit_health(
+    previous_usage: Option<CredentialUsage>,
+    result: Result<CredentialUsage>,
+) -> CredentialHealth {
+    match result {
+        Ok(usage) => CredentialHealth {
+            usage: Some(usage),
+            error: None,
+            checked_at: now(),
+        },
+        Err(error) => CredentialHealth {
+            // A usage audit is advisory. In particular, the usage endpoint can
+            // rate-limit independently of inference, so a transient audit
+            // failure must not make a working credential unroutable.
+            usage: previous_usage,
+            error: Some(error.to_string()),
+            checked_at: now(),
+        },
     }
 }
 
@@ -221,6 +268,11 @@ async fn proxy(State(state): State<ProxyState>, request: Request) -> Response {
         return error_response(StatusCode::UNAUTHORIZED, "invalid local proxy token");
     }
     let (parts, body) = request.into_parts();
+    let provider = if parts.uri.path().starts_with("/openai/") {
+        Provider::Codex
+    } else {
+        Provider::Claude
+    };
     let bytes = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -239,7 +291,7 @@ async fn proxy(State(state): State<ProxyState>, request: Request) -> Response {
                 .map(str::to_owned)
         });
 
-    let first = match select_credential(&state, model.as_deref(), None).await {
+    let first = match select_credential(&state, model.as_deref(), None, provider).await {
         Some(credential) => credential,
         None => {
             return error_response(
@@ -258,7 +310,7 @@ async fn proxy(State(state): State<ProxyState>, request: Request) -> Response {
             let status = response.status();
             mark_failed(&state, &first.name, status).await;
             if let Some(second) =
-                select_credential(&state, model.as_deref(), Some(&first.name)).await
+                select_credential(&state, model.as_deref(), Some(&first.name), provider).await
             {
                 return forward(&state, &parts, bytes, &second)
                     .await
@@ -290,11 +342,13 @@ async fn select_credential(
     state: &ProxyState,
     model: Option<&str>,
     exclude: Option<&str>,
+    provider: Provider,
 ) -> Option<StoredCredential> {
     let health = state.health.read().await;
     let current = state.selected.lock().await.clone();
     let eligible = |credential: &&StoredCredential| {
-        exclude != Some(credential.name.as_str())
+        credential.provider == provider
+            && exclude != Some(credential.name.as_str())
             && health
                 .get(&credential.name)
                 .and_then(|entry| entry.usage.as_ref())
@@ -327,7 +381,7 @@ fn utilization(health: &HashMap<String, CredentialHealth>, name: &str, model: Op
     health[name]
         .usage
         .as_ref()
-        .and_then(|usage| usage.tightest_utilization(model))
+        .map(|usage| usage.utilization(model))
         .unwrap_or(0.0)
 }
 
@@ -342,12 +396,27 @@ async fn forward(
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or("/");
+    let (upstream, path) = if credential.provider == Provider::Codex {
+        (
+            codex::RESPONSES_UPSTREAM,
+            path.strip_prefix("/openai").unwrap_or(path),
+        )
+    } else {
+        (UPSTREAM, path)
+    };
     let mut request = state
         .client
-        .request(parts.method.clone(), format!("{UPSTREAM}{path}"))
+        .request(parts.method.clone(), format!("{upstream}{path}"))
         .bearer_auth(&credential.access_token)
-        .header("anthropic-beta", oauth_beta_header(&parts.headers))
         .body(body);
+    if credential.provider == Provider::Codex {
+        request = request.header("openai-beta", "codex-1");
+    } else {
+        request = request.header("anthropic-beta", oauth_beta_header(&parts.headers));
+    }
+    if let Some(account) = &credential.account_id {
+        request = request.header("chatgpt-account-id", account);
+    }
     for (name, value) in &parts.headers {
         if !matches!(
             name.as_str(),
@@ -358,6 +427,7 @@ async fn forward(
                 | "connection"
                 | "proxy-authorization"
                 | "anthropic-beta"
+                | "openai-beta"
         ) {
             request = request.header(name, value);
         }
@@ -392,12 +462,19 @@ async fn mark_failed(state: &ProxyState, name: &str, status: StatusCode) {
         health.error = Some(format!("inference request returned {status}"));
         if status == StatusCode::UNAUTHORIZED {
             health.usage = None;
-        } else if let Some(window) = health
-            .usage
-            .as_mut()
-            .and_then(|usage| usage.five_hour.as_mut())
-        {
-            window.utilization = Some(100.0);
+        } else if let Some(usage) = health.usage.as_mut() {
+            match usage {
+                CredentialUsage::Claude(usage) => {
+                    if let Some(window) = usage.five_hour.as_mut() {
+                        window.utilization = Some(100.0);
+                    }
+                }
+                CredentialUsage::Codex(usage) => {
+                    if let Some(window) = usage.rate_limit.primary_window.as_mut() {
+                        window.used_percent = Some(100.0);
+                    }
+                }
+            }
         }
     }
     let mut selected = state.selected.lock().await;
@@ -455,11 +532,15 @@ mod tests {
                     name: "full".into(),
                     access_token: "secret-a".into(),
                     scopes: vec!["user:profile".into()],
+                    provider: Provider::Claude,
+                    account_id: None,
                 },
                 StoredCredential {
                     name: "ready".into(),
                     access_token: "secret-b".into(),
                     scopes: vec!["user:profile".into()],
+                    provider: Provider::Claude,
+                    account_id: None,
                 },
             ]),
             health: Arc::new(RwLock::new(HashMap::from([
@@ -499,14 +580,15 @@ mod tests {
     #[tokio::test]
     async fn selection_skips_exhausted_and_remains_sticky() {
         let state = test_state();
-        let selected = select_credential(&state, Some("claude-sonnet"), None)
+        let selected = select_credential(&state, Some("claude-sonnet"), None, Provider::Claude)
             .await
             .unwrap();
         assert_eq!(selected.name, "ready");
         assert_eq!(state.selected.lock().await.as_deref(), Some("ready"));
-        let selected_again = select_credential(&state, Some("claude-sonnet"), None)
-            .await
-            .unwrap();
+        let selected_again =
+            select_credential(&state, Some("claude-sonnet"), None, Provider::Claude)
+                .await
+                .unwrap();
         assert_eq!(selected_again.name, "ready");
     }
 
@@ -517,6 +599,38 @@ mod tests {
         assert_eq!(state.selected.lock().await.as_deref(), Some("ready"));
         assert!(!set_selected_account(&state, "missing").await);
         assert_eq!(state.selected.lock().await.as_deref(), Some("ready"));
+    }
+
+    #[tokio::test]
+    async fn provider_selection_never_crosses_subscription_types() {
+        let mut state = test_state();
+        Arc::make_mut(&mut state.credentials).push(StoredCredential {
+            name: "codex".into(),
+            access_token: "secret-c".into(),
+            scopes: Vec::new(),
+            provider: Provider::Codex,
+            account_id: Some("account-c".into()),
+        });
+        state.health.write().await.insert(
+            "codex".into(),
+            CredentialHealth {
+                usage: Some(CredentialUsage::Codex(
+                    serde_json::from_value(serde_json::json!({
+                        "rate_limit": {
+                            "primary_window": {"used_percent": 10.0, "reset_at": 1},
+                            "secondary_window": {"used_percent": 20.0, "reset_at": 2}
+                        }
+                    }))
+                    .unwrap(),
+                )),
+                error: None,
+                checked_at: 1,
+            },
+        );
+        let selected = select_credential(&state, None, None, Provider::Codex)
+            .await
+            .unwrap();
+        assert_eq!(selected.name, "codex");
     }
 
     #[test]
@@ -546,5 +660,46 @@ mod tests {
             "feature-a,oauth-2025-04-20".parse().unwrap(),
         );
         assert_eq!(oauth_beta_header(&headers), "feature-a,oauth-2025-04-20");
+    }
+
+    #[test]
+    fn failed_audit_retains_last_known_usage() {
+        let previous = CredentialUsage::Claude(
+            serde_json::from_value(serde_json::json!({
+                "five_hour": {"utilization": 25.0, "resets_at": null}
+            }))
+            .unwrap(),
+        );
+
+        let health = audit_health(
+            Some(previous),
+            Err(AppError(
+                "usage endpoint rate limited; retry after 300".into(),
+            )),
+        );
+
+        assert_eq!(
+            health
+                .usage
+                .as_ref()
+                .and_then(|usage| match usage {
+                    CredentialUsage::Claude(usage) => usage.five_hour.as_ref(),
+                    CredentialUsage::Codex(_) => None,
+                })
+                .and_then(|window| window.utilization),
+            Some(25.0)
+        );
+        assert_eq!(
+            health.error.as_deref(),
+            Some("usage endpoint rate limited; retry after 300")
+        );
+    }
+
+    #[test]
+    fn initial_failed_audit_remains_unroutable() {
+        let health = audit_health(None, Err(AppError("usage request failed".into())));
+
+        assert!(health.usage.is_none());
+        assert_eq!(health.error.as_deref(), Some("usage request failed"));
     }
 }

@@ -11,6 +11,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
+mod codex;
 mod lifecycle;
 mod proxy;
 pub mod usage;
@@ -56,7 +57,7 @@ impl From<serde_json::Error> for AppError {
 #[command(
     name = "subhub",
     version,
-    about = "Manage named Claude Code subscriptions in the macOS Keychain"
+    about = "Manage Claude Code and Codex subscriptions in the macOS Keychain"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -65,7 +66,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Log in with Claude Code and save the resulting credential under NAME
+    /// Choose Claude Code or Codex and save its subscription under NAME
     Add {
         /// Friendly name for the credential
         name: String,
@@ -147,9 +148,23 @@ struct Index {
 
 #[derive(Deserialize, Serialize)]
 struct VaultEntry {
+    #[serde(default = "claude_provider")]
+    provider: Provider,
     credential: Value,
     #[serde(rename = "oauthAccount")]
     oauth_account: Value,
+}
+
+fn claude_provider() -> Provider {
+    Provider::Claude
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Provider {
+    #[default]
+    Claude,
+    Codex,
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +172,8 @@ pub(crate) struct StoredCredential {
     pub name: String,
     pub access_token: String,
     pub scopes: Vec<String>,
+    pub provider: Provider,
+    pub account_id: Option<String>,
 }
 
 impl Index {
@@ -253,6 +270,12 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
         )));
     }
 
+    println!("Choose subscription type:\n  1) Claude Code\n  2) Codex");
+    let mut choice = String::new();
+    io::stdin().read_line(&mut choice)?;
+    if choice.trim() == "2" {
+        return add_codex(path, index, name);
+    }
     println!("Opening Claude Code login for credential \"{name}\"...");
     let oauth_scopes = requested_oauth_scopes(env::var_os(CLAUDE_OAUTH_SCOPES_ENV).as_deref());
     let status = Command::new("claude")
@@ -277,6 +300,7 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
     let credential_value: Value = serde_json::from_str(&credential)?;
     let oauth_account = read_oauth_account()?;
     let vault_entry = serde_json::to_string(&VaultEntry {
+        provider: Provider::Claude,
         credential: credential_value,
         oauth_account,
     })?;
@@ -285,6 +309,55 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
     index.add(name);
     save_index(path, index)?;
     println!("Saved \"{name}\" and made it active.");
+    Ok(())
+}
+
+fn add_codex(path: &Path, index: &mut Index, name: &str) -> Result<()> {
+    use rand::distr::{Alphanumeric, SampleString};
+    let temporary_home = env::temp_dir().join(format!(
+        "subhub-codex-login-{}",
+        Alphanumeric.sample_string(&mut rand::rng(), 16)
+    ));
+    fs::create_dir(&temporary_home)?;
+    fs::set_permissions(&temporary_home, fs::Permissions::from_mode(0o700))?;
+    let auth_path = temporary_home.join("auth.json");
+    println!("Opening Codex ChatGPT login for credential \"{name}\"...");
+    let status = Command::new("codex")
+        .args(["-c", "cli_auth_credentials_store=\"file\"", "login"])
+        .env("CODEX_HOME", &temporary_home)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| AppError(format!("could not run `codex login`: {error}")))?;
+    let capture = (|| {
+        require_success(status, "`codex login` failed")?;
+        let raw = fs::read_to_string(&auth_path)
+            .map_err(|error| AppError(format!("Codex login cache was not readable: {error}")))?;
+        let credential: Value = serde_json::from_str(&raw)?;
+        for key in ["access_token", "refresh_token", "account_id"] {
+            if credential
+                .pointer(&format!("/tokens/{key}"))
+                .and_then(Value::as_str)
+                .is_none()
+            {
+                return Err(AppError(format!(
+                    "Codex login did not provide tokens.{key}"
+                )));
+            }
+        }
+        let entry = serde_json::to_string(&VaultEntry {
+            provider: Provider::Codex,
+            credential,
+            oauth_account: Value::Null,
+        })?;
+        keychain_write(VAULT_SERVICE, name, &entry)
+    })();
+    fs::remove_dir_all(&temporary_home)?;
+    capture?;
+    index.add(name);
+    save_index(path, index)?;
+    println!("Saved Codex subscription \"{name}\".");
     Ok(())
 }
 
@@ -300,7 +373,17 @@ fn list(index: &Index) -> Result<()> {
         } else {
             " "
         };
-        println!("{marker} {name}");
+        let provider = vault_read(name)
+            .ok()
+            .and_then(|stored| serde_json::from_str::<Value>(&stored).ok())
+            .and_then(|entry| {
+                entry
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "claude".into());
+        println!("{marker} {name} [{provider}]");
     }
     Ok(())
 }
@@ -318,14 +401,17 @@ fn set(path: &Path, index: &mut Index, name: &str) -> Result<()> {
             "credential \"{name}\" is indexed but missing from Keychain: {error}"
         ))
     })?;
-    let (credential, oauth_account) = decode_vault_entry(&stored).map_err(|error| {
+    let entry: VaultEntry = serde_json::from_str(&stored).map_err(|error| {
         AppError(format!(
             "{error}; refresh it with `subhub add {name} --force`"
         ))
     })?;
-    validate_credential(&credential)?;
-    keychain_write(ACTIVE_SERVICE, &current_user()?, &credential)?;
-    write_oauth_account(&oauth_account)?;
+    if entry.provider == Provider::Claude {
+        let credential = serde_json::to_string(&entry.credential)?;
+        validate_credential(&credential)?;
+        keychain_write(ACTIVE_SERVICE, &current_user()?, &credential)?;
+        write_oauth_account(&entry.oauth_account)?;
+    }
 
     index.active = Some(name.to_owned());
     save_index(path, index)?;
@@ -338,6 +424,7 @@ fn set(path: &Path, index: &mut Index, name: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn decode_vault_entry(stored: &str) -> Result<(String, Value)> {
     let parsed: Value = serde_json::from_str(stored)
         .map_err(|_| AppError("saved Keychain entry is not valid JSON".into()))?;
@@ -359,18 +446,25 @@ fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
         })?;
         let parsed: Value = serde_json::from_str(&stored)
             .map_err(|_| AppError(format!("credential \"{name}\" is not valid JSON")))?;
-        let oauth = parsed
+        let provider: Provider = parsed
+            .get("provider")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
+        let credential = parsed
             .get("credential")
-            .and_then(|value| value.get("claudeAiOauth"))
-            .and_then(Value::as_object)
-            .ok_or_else(|| AppError(format!("credential \"{name}\" has no claudeAiOauth")))?;
-        let access_token = oauth
-            .get("accessToken")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| AppError(format!("credential \"{name}\" has no access token")))?;
+            .ok_or_else(|| AppError(format!("credential \"{name}\" has no credential")))?;
+        let oauth = credential.get("claudeAiOauth").and_then(Value::as_object);
+        let access_token = match provider {
+            Provider::Claude => oauth.and_then(|value| value.get("accessToken")),
+            Provider::Codex => credential.pointer("/tokens/access_token"),
+        }
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError(format!("credential \"{name}\" has no access token")))?;
         let scopes = oauth
-            .get("scopes")
+            .and_then(|value| value.get("scopes"))
             .and_then(Value::as_array)
             .map(|values| {
                 values
@@ -384,6 +478,11 @@ fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
             name: name.clone(),
             access_token: access_token.to_owned(),
             scopes,
+            provider,
+            account_id: credential
+                .pointer("/tokens/account_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         });
     }
     Ok(credentials)
@@ -392,9 +491,17 @@ fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
 #[derive(Serialize)]
 struct AuditResult {
     name: String,
+    provider: Provider,
     status: &'static str,
-    usage: Option<usage::UsageSnapshot>,
+    usage: Option<AuditUsage>,
     error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum AuditUsage {
+    Claude(usage::UsageSnapshot),
+    Codex(codex::UsageSnapshot),
 }
 
 async fn audit(credentials: Vec<StoredCredential>, json: bool) -> Result<()> {
@@ -404,9 +511,39 @@ async fn audit(credentials: Vec<StoredCredential>, json: bool) -> Result<()> {
         ));
     }
     let usage_client = usage::UsageClient::new(reqwest::Client::new(), claude_version().as_deref());
+    let client = reqwest::Client::new();
     let mut results = Vec::with_capacity(credentials.len());
     for credential in credentials {
-        let result = if !credential.scopes.is_empty()
+        let provider = credential.provider;
+        let result = if provider == Provider::Codex {
+            match credential.account_id.as_deref() {
+                Some(account) => {
+                    match codex::fetch_usage(&client, &credential.access_token, account).await {
+                        Ok(usage) => AuditResult {
+                            name: credential.name,
+                            provider,
+                            status: "available",
+                            usage: Some(AuditUsage::Codex(usage)),
+                            error: None,
+                        },
+                        Err(error) => AuditResult {
+                            name: credential.name,
+                            provider,
+                            status: "unavailable",
+                            usage: None,
+                            error: Some(error.to_string()),
+                        },
+                    }
+                }
+                None => AuditResult {
+                    name: credential.name,
+                    provider,
+                    status: "unavailable",
+                    usage: None,
+                    error: Some("missing Codex account id".into()),
+                },
+            }
+        } else if !credential.scopes.is_empty()
             && !credential
                 .scopes
                 .iter()
@@ -414,6 +551,7 @@ async fn audit(credentials: Vec<StoredCredential>, json: bool) -> Result<()> {
         {
             AuditResult {
                 name: credential.name,
+                provider,
                 status: "unavailable",
                 usage: None,
                 error: Some("OAuth token lacks user:profile scope".into()),
@@ -422,12 +560,14 @@ async fn audit(credentials: Vec<StoredCredential>, json: bool) -> Result<()> {
             match usage_client.fetch(&credential.access_token).await {
                 Ok(usage) => AuditResult {
                     name: credential.name,
+                    provider,
                     status: "available",
-                    usage: Some(usage),
+                    usage: Some(AuditUsage::Claude(usage)),
                     error: None,
                 },
                 Err(error) => AuditResult {
                     name: credential.name,
+                    provider,
                     status: "unavailable",
                     usage: None,
                     error: Some(error.to_string()),
@@ -442,11 +582,25 @@ async fn audit(credentials: Vec<StoredCredential>, json: bool) -> Result<()> {
     } else {
         for result in results {
             match result.usage {
-                Some(usage) => println!(
-                    "{}: 5h {}, 7d {}",
+                Some(AuditUsage::Claude(usage)) => println!(
+                    "{} [claude]: 5h {}, 7d {}",
                     result.name,
                     format_window(usage.five_hour.as_ref()),
                     format_window(usage.seven_day.as_ref())
+                ),
+                Some(AuditUsage::Codex(usage)) => println!(
+                    "{} [codex]: primary {:.1}%, secondary {:.1}%",
+                    result.name,
+                    usage
+                        .rate_limit
+                        .primary_window
+                        .and_then(|w| w.used_percent)
+                        .unwrap_or(0.0),
+                    usage
+                        .rate_limit
+                        .secondary_window
+                        .and_then(|w| w.used_percent)
+                        .unwrap_or(0.0)
                 ),
                 None => println!(
                     "{}: unavailable ({})",
@@ -838,6 +992,7 @@ mod tests {
     #[test]
     fn vault_entry_round_trips_credential_and_account() {
         let entry = VaultEntry {
+            provider: Provider::Claude,
             credential: serde_json::json!({
                 "claudeAiOauth": {"accessToken": "a", "refreshToken": "r"}
             }),

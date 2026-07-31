@@ -11,6 +11,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use toml_edit::{DocumentMut, Item, Table, value};
 
 const GATEWAY_SERVICE: &str = "subhub-gateway";
 const GATEWAY_TOKEN_ACCOUNT: &str = "local-client-token";
@@ -31,6 +32,8 @@ struct InstallState {
     previous_api_key_helper: PreviousValue,
     #[serde(default)]
     previous_status_line: Option<PreviousValue>,
+    #[serde(default)]
+    previous_codex_config: Option<String>,
 }
 
 pub(crate) fn read_gateway_token() -> Result<String> {
@@ -84,7 +87,7 @@ pub(crate) fn install() -> Result<()> {
     let state_path = install_state_path()?;
     let mut settings = read_json_object(&settings_path)?;
     ensure_no_conflicting_claude_credentials(&settings)?;
-    let state = if state_path.exists() {
+    let mut state = if state_path.exists() {
         read_install_state(&state_path)?
     } else {
         InstallState {
@@ -93,8 +96,12 @@ pub(crate) fn install() -> Result<()> {
             previous_base_url: get_nested(&settings, &["env", "ANTHROPIC_BASE_URL"]),
             previous_api_key_helper: get_nested(&settings, &["apiKeyHelper"]),
             previous_status_line: Some(get_nested(&settings, &["statusLine"])),
+            previous_codex_config: Some(read_codex_config()?),
         }
     };
+    if state.previous_codex_config.is_none() {
+        state.previous_codex_config = Some(read_codex_config()?);
+    }
     let previous_status_line = state
         .previous_status_line
         .or_else(|| Some(get_nested(&settings, &["statusLine"])));
@@ -127,6 +134,7 @@ pub(crate) fn install() -> Result<()> {
     };
     save_json_file(&state_path, &current_state)?;
     save_json_file(&settings_path, &settings)?;
+    install_codex_config()?;
     write_auth_helper(&auth_helper_path()?, &binary_path)?;
     write_statusline_helper(&statusline_helper_path()?, &binary_path)?;
     let agent_path = launch_agent_path()?;
@@ -135,6 +143,7 @@ pub(crate) fn install() -> Result<()> {
 
     println!("Subhub gateway installed and running.");
     println!("Claude Code will use {BASE_URL} automatically.");
+    println!("Codex CLI will use {BASE_URL}/openai automatically.");
     Ok(())
 }
 
@@ -144,6 +153,7 @@ pub(crate) fn uninstall(purge: bool) -> Result<()> {
     if state_path.exists() {
         let state = read_install_state(&state_path)?;
         restore_claude_settings(&state)?;
+        restore_codex_config(&state)?;
         fs::remove_file(&state_path).map_err(|error| {
             AppError(format!(
                 "could not remove {}: {error}",
@@ -319,11 +329,21 @@ fn format_statusline_segment(status: &Value) -> String {
     let five = usage
         .and_then(|usage| usage.get("five_hour"))
         .and_then(|window| window.get("utilization"))
-        .and_then(Value::as_f64);
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            usage
+                .and_then(|usage| usage.pointer("/rate_limit/primary_window/used_percent"))
+                .and_then(Value::as_f64)
+        });
     let seven = usage
         .and_then(|usage| usage.get("seven_day"))
         .and_then(|window| window.get("utilization"))
-        .and_then(Value::as_f64);
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            usage
+                .and_then(|usage| usage.pointer("/rate_limit/secondary_window/used_percent"))
+                .and_then(Value::as_f64)
+        });
 
     let mut parts = vec![format!("Subhub: {selected}")];
     if let Some(five) = five {
@@ -452,6 +472,80 @@ fn claude_settings_path() -> Result<PathBuf> {
         .map(PathBuf::from)
         .map(|home| home.join(".claude").join("settings.json"))
         .ok_or_else(|| AppError("HOME is not set".into()))
+}
+
+fn codex_config_path() -> Result<PathBuf> {
+    env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .map(|home| home.join("config.toml"))
+        .ok_or_else(|| AppError("CODEX_HOME and HOME are not set".into()))
+}
+
+fn read_codex_config() -> Result<String> {
+    let path = codex_config_path()?;
+    if path.exists() {
+        fs::read_to_string(&path)
+            .map_err(|error| AppError(format!("could not read {}: {error}", path.display())))
+    } else {
+        Ok(String::new())
+    }
+}
+
+fn install_codex_config() -> Result<()> {
+    let path = codex_config_path()?;
+    let mut document = read_codex_config()?
+        .parse::<DocumentMut>()
+        .map_err(|error| AppError(format!("invalid {}: {error}", path.display())))?;
+    document["model_provider"] = value("subhub");
+    let mut provider = Table::new();
+    provider["name"] = value("Subhub");
+    provider["base_url"] = value(format!("{BASE_URL}/openai"));
+    provider["wire_api"] = value("responses");
+    let mut auth = Table::new();
+    auth["command"] = value(auth_helper_path()?.to_string_lossy().into_owned());
+    auth["refresh_interval_ms"] = value(0);
+    provider["auth"] = Item::Table(auth);
+    document["model_providers"]["subhub"] = Item::Table(provider);
+    write_private_file(&path, document.to_string().as_bytes())
+}
+
+fn restore_codex_config(state: &InstallState) -> Result<()> {
+    let Some(previous) = &state.previous_codex_config else {
+        return Ok(());
+    };
+    let path = codex_config_path()?;
+    let mut current = read_codex_config()?
+        .parse::<DocumentMut>()
+        .map_err(|error| AppError(format!("invalid {}: {error}", path.display())))?;
+    let prior = previous
+        .parse::<DocumentMut>()
+        .map_err(|error| AppError(format!("saved Codex config is invalid: {error}")))?;
+    if current["model_provider"].as_str() == Some("subhub") {
+        current["model_provider"] = prior.get("model_provider").cloned().unwrap_or(Item::None);
+    }
+    if current["model_providers"]["subhub"]["base_url"].as_str()
+        == Some(&format!("{BASE_URL}/openai"))
+    {
+        current["model_providers"]["subhub"] = prior
+            .get("model_providers")
+            .and_then(|item| item.get("subhub"))
+            .cloned()
+            .unwrap_or(Item::None);
+    }
+    write_private_file(&path, current.to_string().as_bytes())
+}
+
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn launch_agent_path() -> Result<PathBuf> {
