@@ -115,6 +115,8 @@ enum GatewayCommands {
     },
     /// Install and start the background gateway
     Install,
+    /// Run uninstall then install in a single command, preserving saved credentials
+    Reinstall,
     /// Stop the gateway and remove its Claude integration
     Uninstall {
         /// Also remove Subhub credentials, token, and index
@@ -224,6 +226,7 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
             }))
         }
         GatewayCommands::Install => lifecycle::install(),
+        GatewayCommands::Reinstall => lifecycle::reinstall(),
         GatewayCommands::Uninstall { purge } => lifecycle::uninstall(purge),
         GatewayCommands::Start => lifecycle::start(),
         GatewayCommands::Stop => lifecycle::stop(),

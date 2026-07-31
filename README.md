@@ -55,6 +55,7 @@ subhub set <name>                 Select an account
 subhub audit [--json]             Show subscription usage
 
 subhub gateway install            Install and start the background gateway
+subhub gateway reinstall          Run uninstall then install in one command
 subhub gateway status             Show gateway health
 subhub gateway start|stop|restart Manage the gateway
 subhub gateway uninstall [--purge]
@@ -84,6 +85,15 @@ To remove the integration but keep saved accounts:
 ```sh
 subhub gateway uninstall
 ```
+
+If restarting does not recover the gateway, run:
+
+```sh
+subhub gateway reinstall
+```
+
+This runs `subhub gateway uninstall` followed by `subhub gateway install` in a
+single command. It does not purge saved account credentials.
 
 Add `--purge` to also delete Subhub credentials, its gateway token, and its
 local index. OAuth refresh is delegated to Claude Code; re-add an expired

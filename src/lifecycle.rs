@@ -188,6 +188,11 @@ pub(crate) fn uninstall(purge: bool) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn reinstall() -> Result<()> {
+    uninstall(false)?;
+    install()
+}
+
 pub(crate) fn start() -> Result<()> {
     let agent_path = launch_agent_path()?;
     if !agent_path.exists() {
