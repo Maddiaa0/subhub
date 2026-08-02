@@ -9,7 +9,7 @@ repository = "https://github.com/Maddiaa0/subhub"
 homepage = "https://github.com/Maddiaa0/subhub"
 documentation = "https://docs.rs/subhub"
 readme = "README.md"
-keywords = ["claude", "oauth", "keychain", "subscription", "proxy"]
+keywords = ["claude", "oauth", "credentials", "subscription", "proxy"]
 categories = ["command-line-utilities", "authentication"]
 
 [dependencies]

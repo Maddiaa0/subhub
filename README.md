@@ -2,7 +2,7 @@
 
 Keep Claude Code and Codex running across multiple subscriptions.
 
-Subhub stores OAuth credentials in the macOS Keychain, reports subscription
+Subhub stores OAuth credentials securely for the current platform, reports subscription
 usage, and routes both CLIs through an account for the appropriate provider
 that still has capacity.
 
@@ -11,12 +11,12 @@ that still has capacity.
 - Multiple named Claude Code and Codex accounts.
 - Usage visibility and capacity-aware routing.
 - Session affinity with one safe retry after pre-stream `401` or `429` errors.
-- A persistent, per-user macOS LaunchAgent.
-- Keychain-backed credential and local gateway-token storage.
+- A persistent per-user macOS LaunchAgent or Linux systemd service.
+- Keychain-backed storage on macOS and permission-restricted file storage on Linux.
 
 ## Getting started
 
-Subhub requires macOS, Rust 1.85 or newer, and the `claude` and `codex` CLIs
+Subhub requires macOS or Linux, Rust 1.85 or newer, and the `claude` and `codex` CLIs
 for their respective providers.
 
 ```sh
@@ -33,8 +33,14 @@ To install from a local checkout, run `cargo install --path .`.
 `subhub add` prompts for Claude Code or Codex. Claude accounts are captured
 after the standard `claude auth login --claudeai` flow. Codex accounts are
 captured after a standard `codex login` ChatGPT flow in an isolated temporary
-credential cache. Tokens are stored in the macOS login Keychain and are never
-written to the Subhub index.
+credential cache. On macOS, tokens are stored in the login Keychain. On Linux,
+they are stored in `$XDG_CONFIG_HOME/subhub/credentials.json` (defaulting to
+`~/.config/subhub/credentials.json`) with user-only permissions. Tokens are
+never written to the Subhub index.
+
+The Linux store is not encrypted at rest. Its security comes from the user's
+filesystem permissions, so the config directory and credential file must not be
+shared or made group/world-readable.
 
 ## Commands
 
@@ -79,9 +85,9 @@ upstream. The gateway does not log request or response contents.
 
 ## Background integration
 
-`subhub gateway install` creates and starts the per-user LaunchAgent
-`com.subhub.gateway`. It configures Claude Code with the local Anthropic base
-URL and a Keychain-backed authentication helper. It also adds a status-line
+`subhub gateway install` creates and starts a per-user macOS LaunchAgent or
+Linux systemd user service. It configures Claude Code with the local Anthropic base
+URL and a secure-storage-backed authentication helper. It also adds a status-line
 segment showing the routed Claude account and cached usage.
 
 For Codex, installation adds a `subhub` Responses API provider to
