@@ -1,6 +1,6 @@
 use crate::{
-    AppError, Result, VAULT_SERVICE, index_path, keychain_delete, keychain_read, keychain_write,
-    load_index, save_json_file,
+    AppError, Result, VAULT_SERVICE, credential_delete, credential_read, credential_write,
+    index_path, load_index, save_json_file,
 };
 use rand::distr::{Alphanumeric, SampleString};
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,10 @@ use toml_edit::{DocumentMut, Item, Table, value};
 
 const GATEWAY_SERVICE: &str = "subhub-gateway";
 const GATEWAY_TOKEN_ACCOUNT: &str = "local-client-token";
+#[cfg(target_os = "macos")]
 const LAUNCH_AGENT_LABEL: &str = "com.subhub.gateway";
+#[cfg(target_os = "linux")]
+const SYSTEMD_UNIT_NAME: &str = "subhub-gateway.service";
 const BASE_URL: &str = "http://127.0.0.1:7842";
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -37,7 +40,7 @@ struct InstallState {
 }
 
 pub(crate) fn read_gateway_token() -> Result<String> {
-    keychain_read(GATEWAY_SERVICE, GATEWAY_TOKEN_ACCOUNT)
+    credential_read(GATEWAY_SERVICE, GATEWAY_TOKEN_ACCOUNT)
 }
 
 pub(crate) fn select_gateway_account(name: &str) -> Result<bool> {
@@ -76,7 +79,7 @@ fn ensure_gateway_token() -> Result<String> {
         return Ok(token);
     }
     let token = Alphanumeric.sample_string(&mut rand::rng(), 48);
-    keychain_write(GATEWAY_SERVICE, GATEWAY_TOKEN_ACCOUNT, &token)?;
+    credential_write(GATEWAY_SERVICE, GATEWAY_TOKEN_ACCOUNT, &token)?;
     Ok(token)
 }
 
@@ -137,8 +140,8 @@ pub(crate) fn install() -> Result<()> {
     install_codex_config()?;
     write_auth_helper(&auth_helper_path()?, &binary_path)?;
     write_statusline_helper(&statusline_helper_path()?, &binary_path)?;
-    let agent_path = launch_agent_path()?;
-    write_launch_agent(&agent_path, &binary_path)?;
+    let agent_path = background_service_path()?;
+    write_background_service(&agent_path, &binary_path)?;
     restart()?;
 
     println!("Subhub gateway installed and running.");
@@ -149,6 +152,7 @@ pub(crate) fn install() -> Result<()> {
 
 pub(crate) fn uninstall(purge: bool) -> Result<()> {
     stop()?;
+    disable_background_service()?;
     let state_path = install_state_path()?;
     if state_path.exists() {
         let state = read_install_state(&state_path)?;
@@ -161,7 +165,7 @@ pub(crate) fn uninstall(purge: bool) -> Result<()> {
             ))
         })?;
     }
-    let agent_path = launch_agent_path()?;
+    let agent_path = background_service_path()?;
     if agent_path.exists() {
         fs::remove_file(&agent_path).map_err(|error| {
             AppError(format!(
@@ -170,6 +174,7 @@ pub(crate) fn uninstall(purge: bool) -> Result<()> {
             ))
         })?;
     }
+    refresh_background_services()?;
     let helper_path = auth_helper_path()?;
     if helper_path.exists() {
         fs::remove_file(&helper_path).map_err(|error| {
@@ -204,53 +209,47 @@ pub(crate) fn reinstall() -> Result<()> {
 }
 
 pub(crate) fn start() -> Result<()> {
-    let agent_path = launch_agent_path()?;
+    let agent_path = background_service_path()?;
     if !agent_path.exists() {
         return Err(AppError(
             "Subhub is not installed; run `subhub gateway install`".into(),
         ));
     }
-    let target = launch_target()?;
-    if launchctl(["print", &target]).is_ok() {
+    if background_service_running() {
         return Ok(());
     }
-    launchctl([
-        "bootstrap",
-        &launch_domain()?,
-        agent_path
-            .to_str()
-            .ok_or_else(|| AppError("LaunchAgent path is not UTF-8".into()))?,
-    ])
+    start_background_service(&agent_path)
 }
 
 pub(crate) fn stop() -> Result<()> {
-    let target = launch_target()?;
-    if launchctl(["print", &target]).is_err() {
+    if !background_service_running() {
         return Ok(());
     }
-    launchctl(["bootout", &target])
+    stop_background_service()
 }
 
 pub(crate) fn restart() -> Result<()> {
-    let target = launch_target()?;
-    if launchctl(["print", &target]).is_ok() {
-        launchctl(["kickstart", "-k", &target])
+    if background_service_running() {
+        restart_background_service()
     } else {
         start()
     }
 }
 
 pub(crate) fn status() -> Result<()> {
-    let installed = launch_agent_path()?.exists() && install_state_path()?.exists();
-    let target = launch_target()?;
-    let running = launchctl(["print", &target]).is_ok();
+    let installed = background_service_path()?.exists() && install_state_path()?.exists();
+    let running = background_service_running();
     println!("Installed: {}", yes_no(installed));
     println!("Running:   {}", yes_no(running));
     println!("Endpoint:  {BASE_URL}");
     println!(
         "Token:     {}",
         if read_gateway_token().is_ok() {
-            "available in Keychain"
+            if cfg!(target_os = "macos") {
+                "available in Keychain"
+            } else {
+                "available in credential store"
+            }
         } else {
             "missing"
         }
@@ -402,7 +401,7 @@ fn purge_data() -> Result<()> {
     if index_path.exists() {
         let index = load_index(&index_path)?;
         for name in index.credentials {
-            let _ = keychain_delete(VAULT_SERVICE, &name);
+            let _ = credential_delete(VAULT_SERVICE, &name);
         }
         fs::remove_file(&index_path).map_err(|error| {
             AppError(format!(
@@ -411,7 +410,7 @@ fn purge_data() -> Result<()> {
             ))
         })?;
     }
-    let _ = keychain_delete(GATEWAY_SERVICE, GATEWAY_TOKEN_ACCOUNT);
+    let _ = credential_delete(GATEWAY_SERVICE, GATEWAY_TOKEN_ACCOUNT);
     Ok(())
 }
 
@@ -548,7 +547,8 @@ fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn launch_agent_path() -> Result<PathBuf> {
+#[cfg(target_os = "macos")]
+fn background_service_path() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| {
@@ -559,7 +559,17 @@ fn launch_agent_path() -> Result<PathBuf> {
         .ok_or_else(|| AppError("HOME is not set".into()))
 }
 
-fn write_launch_agent(path: &Path, binary: &Path) -> Result<()> {
+#[cfg(target_os = "linux")]
+fn background_service_path() -> Result<PathBuf> {
+    env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .map(|config| config.join("systemd").join("user").join(SYSTEMD_UNIT_NAME))
+        .ok_or_else(|| AppError("XDG_CONFIG_HOME and HOME are not set".into()))
+}
+
+#[cfg(target_os = "macos")]
+fn write_background_service(path: &Path, binary: &Path) -> Result<()> {
     let binary = xml_escape(
         binary
             .to_str()
@@ -597,6 +607,15 @@ fn write_launch_agent(path: &Path, binary: &Path) -> Result<()> {
     fs::create_dir_all(parent)?;
     fs::write(path, contents)
         .map_err(|error| AppError(format!("could not write {}: {error}", path.display())))
+}
+
+#[cfg(target_os = "linux")]
+fn write_background_service(path: &Path, binary: &Path) -> Result<()> {
+    let executable = systemd_quote(binary)?;
+    let contents = format!(
+        "[Unit]\nDescription=Subhub credential-routing gateway\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={executable} gateway serve --background\nRestart=on-failure\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n"
+    );
+    write_private_file(path, contents.as_bytes())
 }
 
 fn write_auth_helper(path: &Path, binary: &Path) -> Result<()> {
@@ -786,6 +805,7 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", raw.replace('\'', "'\"'\"'"))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -795,14 +815,17 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+#[cfg(target_os = "macos")]
 fn launch_domain() -> Result<String> {
     Ok(format!("gui/{}", user_id()?))
 }
 
+#[cfg(target_os = "macos")]
 fn launch_target() -> Result<String> {
     Ok(format!("{}/{LAUNCH_AGENT_LABEL}", launch_domain()?))
 }
 
+#[cfg(target_os = "macos")]
 fn user_id() -> Result<String> {
     let output = Command::new("/usr/bin/id")
         .arg("-u")
@@ -816,6 +839,7 @@ fn user_id() -> Result<String> {
         .map_err(|_| AppError("`id -u` returned non-UTF-8 output".into()))
 }
 
+#[cfg(target_os = "macos")]
 fn launchctl<const N: usize>(arguments: [&str; N]) -> Result<()> {
     let output = Command::new("/bin/launchctl")
         .args(arguments)
@@ -830,6 +854,102 @@ fn launchctl<const N: usize>(arguments: [&str; N]) -> Result<()> {
     } else {
         format!("launchctl failed: {detail}")
     }))
+}
+
+#[cfg(target_os = "macos")]
+fn background_service_running() -> bool {
+    launch_target().is_ok_and(|target| launchctl(["print", &target]).is_ok())
+}
+
+#[cfg(target_os = "macos")]
+fn start_background_service(path: &Path) -> Result<()> {
+    launchctl([
+        "bootstrap",
+        &launch_domain()?,
+        path.to_str()
+            .ok_or_else(|| AppError("LaunchAgent path is not UTF-8".into()))?,
+    ])
+}
+
+#[cfg(target_os = "macos")]
+fn stop_background_service() -> Result<()> {
+    launchctl(["bootout", &launch_target()?])
+}
+
+#[cfg(target_os = "macos")]
+fn restart_background_service() -> Result<()> {
+    launchctl(["kickstart", "-k", &launch_target()?])
+}
+
+#[cfg(target_os = "macos")]
+fn disable_background_service() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn refresh_background_services() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn systemctl(arguments: &[&str]) -> Result<()> {
+    let output = Command::new("systemctl")
+        .arg("--user")
+        .args(arguments)
+        .output()
+        .map_err(|error| AppError(format!("could not run `systemctl --user`: {error}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(AppError(if detail.is_empty() {
+        format!("systemctl --user failed with {}", output.status)
+    } else {
+        format!("systemctl --user failed: {detail}")
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn background_service_running() -> bool {
+    systemctl(&["is-active", "--quiet", SYSTEMD_UNIT_NAME]).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn start_background_service(_path: &Path) -> Result<()> {
+    systemctl(&["daemon-reload"])?;
+    systemctl(&["enable", "--now", SYSTEMD_UNIT_NAME])
+}
+
+#[cfg(target_os = "linux")]
+fn stop_background_service() -> Result<()> {
+    systemctl(&["stop", SYSTEMD_UNIT_NAME])
+}
+
+#[cfg(target_os = "linux")]
+fn restart_background_service() -> Result<()> {
+    systemctl(&["restart", SYSTEMD_UNIT_NAME])
+}
+
+#[cfg(target_os = "linux")]
+fn disable_background_service() -> Result<()> {
+    let _ = systemctl(&["disable", SYSTEMD_UNIT_NAME]);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn refresh_background_services() -> Result<()> {
+    systemctl(&["daemon-reload"])
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_quote(path: &Path) -> Result<String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| AppError("Subhub executable path is not UTF-8".into()))?;
+    Ok(format!(
+        "\"{}\"",
+        path.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
 }
 
 #[cfg(test)]
@@ -951,15 +1071,22 @@ mod tests {
         let statusline = directory.join("statusline");
         let binary = Path::new("/Applications/Sub Hub/subhub");
 
-        write_launch_agent(&agent, binary).unwrap();
+        write_background_service(&agent, binary).unwrap();
         write_auth_helper(&helper, binary).unwrap();
         write_statusline_helper(&statusline, binary).unwrap();
 
         let agent_contents = fs::read_to_string(&agent).unwrap();
         let helper_contents = fs::read_to_string(&helper).unwrap();
         let statusline_contents = fs::read_to_string(&statusline).unwrap();
+        #[cfg(target_os = "macos")]
         assert!(agent_contents.contains("<string>gateway</string>"));
+        #[cfg(target_os = "macos")]
         assert!(agent_contents.contains("<string>--background</string>"));
+        #[cfg(target_os = "linux")]
+        assert!(
+            agent_contents
+                .contains("ExecStart=\"/Applications/Sub Hub/subhub\" gateway serve --background")
+        );
         assert!(!agent_contents.contains("local-client-token"));
         assert_eq!(
             helper_contents,

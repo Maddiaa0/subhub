@@ -2,6 +2,8 @@ use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -57,7 +59,7 @@ impl From<serde_json::Error> for AppError {
 #[command(
     name = "subhub",
     version,
-    about = "Manage Claude Code and Codex subscriptions in the macOS Keychain"
+    about = "Manage Claude Code and Codex subscriptions"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -199,8 +201,8 @@ impl Index {
 }
 
 pub fn run() -> Result<()> {
-    if !cfg!(target_os = "macos") {
-        return Err(AppError("subhub currently requires macOS".into()));
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        return Err(AppError("subhub currently requires macOS or Linux".into()));
     }
 
     dispatch(Cli::parse())
@@ -290,7 +292,7 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
     require_success(status, "`claude auth login` failed")?;
 
     let account = current_user()?;
-    let credential = keychain_read(ACTIVE_SERVICE, &account).map_err(|error| {
+    let credential = credential_read(ACTIVE_SERVICE, &account).map_err(|error| {
         AppError(format!(
             "login completed, but the Claude Code credential could not be read: {error}"
         ))
@@ -304,7 +306,7 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
         credential: credential_value,
         oauth_account,
     })?;
-    keychain_write(VAULT_SERVICE, name, &vault_entry)?;
+    credential_write(VAULT_SERVICE, name, &vault_entry)?;
 
     index.add(name);
     save_index(path, index)?;
@@ -351,7 +353,7 @@ fn add_codex(path: &Path, index: &mut Index, name: &str) -> Result<()> {
             credential,
             oauth_account: Value::Null,
         })?;
-        keychain_write(VAULT_SERVICE, name, &entry)
+        credential_write(VAULT_SERVICE, name, &entry)
     })();
     fs::remove_dir_all(&temporary_home)?;
     capture?;
@@ -398,7 +400,7 @@ fn set(path: &Path, index: &mut Index, name: &str) -> Result<()> {
 
     let stored = vault_read(name).map_err(|error| {
         AppError(format!(
-            "credential \"{name}\" is indexed but missing from Keychain: {error}"
+            "credential \"{name}\" is indexed but missing from secure storage: {error}"
         ))
     })?;
     let entry: VaultEntry = serde_json::from_str(&stored).map_err(|error| {
@@ -409,7 +411,7 @@ fn set(path: &Path, index: &mut Index, name: &str) -> Result<()> {
     if entry.provider == Provider::Claude {
         let credential = serde_json::to_string(&entry.credential)?;
         validate_credential(&credential)?;
-        keychain_write(ACTIVE_SERVICE, &current_user()?, &credential)?;
+        credential_write(ACTIVE_SERVICE, &current_user()?, &credential)?;
         write_oauth_account(&entry.oauth_account)?;
     }
 
@@ -441,7 +443,7 @@ fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
     for name in &index.credentials {
         let stored = vault_read(name).map_err(|error| {
             AppError(format!(
-                "credential \"{name}\" is missing from Keychain: {error}"
+                "credential \"{name}\" is missing from secure storage: {error}"
             ))
         })?;
         let parsed: Value = serde_json::from_str(&stored)
@@ -710,16 +712,16 @@ fn validate_name(name: &str) -> Result<()> {
 }
 
 fn validate_credential(raw: &str) -> Result<()> {
-    let parsed: Value = serde_json::from_str(raw)
-        .map_err(|_| AppError("Keychain credential is not valid JSON".into()))?;
+    let parsed: Value =
+        serde_json::from_str(raw).map_err(|_| AppError("credential is not valid JSON".into()))?;
     let oauth = parsed
         .get("claudeAiOauth")
         .and_then(Value::as_object)
-        .ok_or_else(|| AppError("Keychain credential has no claudeAiOauth object".into()))?;
+        .ok_or_else(|| AppError("credential has no claudeAiOauth object".into()))?;
     for key in ["accessToken", "refreshToken"] {
         if oauth.get(key).and_then(Value::as_str).is_none() {
             return Err(AppError(format!(
-                "Keychain credential has no valid claudeAiOauth.{key}"
+                "credential has no valid claudeAiOauth.{key}"
             )));
         }
     }
@@ -742,8 +744,8 @@ fn requested_oauth_scopes(existing: Option<&std::ffi::OsStr>) -> String {
 }
 
 fn validate_required_scopes(raw: &str) -> Result<()> {
-    let parsed: Value = serde_json::from_str(raw)
-        .map_err(|_| AppError("Keychain credential is not valid JSON".into()))?;
+    let parsed: Value =
+        serde_json::from_str(raw).map_err(|_| AppError("credential is not valid JSON".into()))?;
     let scopes = parsed
         .get("claudeAiOauth")
         .and_then(|oauth| oauth.get("scopes"))
@@ -774,7 +776,8 @@ fn validate_required_scopes(raw: &str) -> Result<()> {
     }
 }
 
-fn keychain_read(service: &str, account: &str) -> Result<String> {
+#[cfg(target_os = "macos")]
+fn credential_read(service: &str, account: &str) -> Result<String> {
     let output = Command::new("security")
         .args(["find-generic-password", "-s", service, "-a", account, "-w"])
         .output()
@@ -792,7 +795,8 @@ fn keychain_read(service: &str, account: &str) -> Result<String> {
         .map_err(|_| AppError("Keychain returned a non-UTF-8 credential".into()))
 }
 
-fn keychain_write(service: &str, account: &str, credential: &str) -> Result<()> {
+#[cfg(target_os = "macos")]
+fn credential_write(service: &str, account: &str, credential: &str) -> Result<()> {
     let output = Command::new("security")
         .args([
             "add-generic-password",
@@ -813,7 +817,8 @@ fn keychain_write(service: &str, account: &str, credential: &str) -> Result<()> 
     Err(AppError(format!("could not update Keychain: {detail}")))
 }
 
-fn keychain_delete(service: &str, account: &str) -> Result<()> {
+#[cfg(target_os = "macos")]
+fn credential_delete(service: &str, account: &str) -> Result<()> {
     let output = Command::new("security")
         .args(["delete-generic-password", "-s", service, "-a", account])
         .output()
@@ -829,12 +834,116 @@ fn keychain_delete(service: &str, account: &str) -> Result<()> {
     }))
 }
 
+#[cfg(target_os = "linux")]
+fn credential_read(service: &str, account: &str) -> Result<String> {
+    if service == ACTIVE_SERVICE {
+        return fs::read_to_string(claude_credentials_path()?).map_err(|error| {
+            AppError(format!(
+                "Claude Code credential file was not readable: {error}"
+            ))
+        });
+    }
+    let path = credential_store_path()?;
+    let store = read_credential_store(&path)?;
+    store
+        .get(service)
+        .and_then(|accounts| accounts.get(account))
+        .cloned()
+        .ok_or_else(|| AppError("credential was not found".into()))
+}
+
+#[cfg(target_os = "linux")]
+fn credential_write(service: &str, account: &str, credential: &str) -> Result<()> {
+    if service == ACTIVE_SERVICE {
+        return write_private_bytes(&claude_credentials_path()?, credential.as_bytes());
+    }
+    let path = credential_store_path()?;
+    let mut store = read_credential_store(&path)?;
+    store
+        .entry(service.to_owned())
+        .or_default()
+        .insert(account.to_owned(), credential.to_owned());
+    write_credential_store(&path, &store)
+}
+
+#[cfg(target_os = "linux")]
+fn credential_delete(service: &str, account: &str) -> Result<()> {
+    let path = credential_store_path()?;
+    let mut store = read_credential_store(&path)?;
+    let removed = store
+        .get_mut(service)
+        .and_then(|accounts| accounts.remove(account));
+    if removed.is_none() {
+        return Err(AppError("credential was not found".into()));
+    }
+    if store.get(service).is_some_and(BTreeMap::is_empty) {
+        store.remove(service);
+    }
+    write_credential_store(&path, &store)
+}
+
+#[cfg(target_os = "linux")]
+type CredentialStore = BTreeMap<String, BTreeMap<String, String>>;
+
+#[cfg(target_os = "linux")]
+fn read_credential_store(path: &Path) -> Result<CredentialStore> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|error| AppError(format!("could not read {}: {error}", path.display())))?;
+    serde_json::from_str(&raw).map_err(|error| {
+        AppError(format!(
+            "invalid credential store {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn write_credential_store(path: &Path, store: &CredentialStore) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(store)?;
+    write_private_bytes(path, &bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError("credential path has no parent directory".into()))?;
+    fs::create_dir_all(parent)?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    let temporary = path.with_extension("json.tmp");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true).mode(0o600);
+    let mut file = options.open(&temporary)?;
+    io::Write::write_all(&mut file, bytes)?;
+    file.sync_all()?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn credential_store_path() -> Result<PathBuf> {
+    Ok(config_base_path()?.join("subhub").join("credentials.json"))
+}
+
+#[cfg(target_os = "linux")]
+fn claude_credentials_path() -> Result<PathBuf> {
+    env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
+        .map(|directory| directory.join(".credentials.json"))
+        .ok_or_else(|| AppError("CLAUDE_CONFIG_DIR and HOME are not set".into()))
+}
+
 fn vault_read(name: &str) -> Result<String> {
-    match keychain_read(VAULT_SERVICE, name) {
+    match credential_read(VAULT_SERVICE, name) {
         Ok(stored) => Ok(stored),
-        Err(current_error) => match keychain_read(LEGACY_VAULT_SERVICE, name) {
+        Err(current_error) => match credential_read(LEGACY_VAULT_SERVICE, name) {
             Ok(stored) => {
-                keychain_write(VAULT_SERVICE, name, &stored)?;
+                credential_write(VAULT_SERVICE, name, &stored)?;
                 Ok(stored)
             }
             Err(_) => Err(current_error),
@@ -858,15 +967,20 @@ fn current_user() -> Result<String> {
 }
 
 fn config_base_path() -> Result<PathBuf> {
-    env::var_os("XDG_CONFIG")
-        .or_else(|| env::var_os("XDG_CONFIG_HOME"))
+    let path = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .ok_or_else(|| AppError("XDG_CONFIG, XDG_CONFIG_HOME, and HOME are not set".into()))
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+    #[cfg(target_os = "macos")]
+    let path = env::var_os("XDG_CONFIG").map(PathBuf::from).or(path);
+    path.ok_or_else(|| AppError("XDG_CONFIG_HOME and HOME are not set".into()))
 }
 
 fn index_path() -> Result<PathBuf> {
-    Ok(config_base_path()?.join(".subhub").join("index.json"))
+    #[cfg(target_os = "macos")]
+    let directory = ".subhub";
+    #[cfg(target_os = "linux")]
+    let directory = "subhub";
+    Ok(config_base_path()?.join(directory).join("index.json"))
 }
 
 fn legacy_index_path() -> Result<PathBuf> {
@@ -1071,6 +1185,42 @@ mod tests {
         assert_eq!(migrated.credentials, ["personal"]);
         assert_eq!(migrated.active.as_deref(), Some("personal"));
         assert!(subhub_path.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_credential_store_is_private_and_round_trips() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!(
+            "subhub-credential-test-{}-{unique}",
+            std::process::id()
+        ));
+        let path = directory.join("subhub").join("credentials.json");
+        let mut store = CredentialStore::new();
+        store
+            .entry(VAULT_SERVICE.into())
+            .or_default()
+            .insert("personal".into(), "secret".into());
+
+        write_credential_store(&path, &store).unwrap();
+
+        assert_eq!(read_credential_store(&path).unwrap(), store);
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 }
