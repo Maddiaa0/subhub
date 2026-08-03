@@ -75,6 +75,9 @@ enum Commands {
         /// Replace an existing credential with the same name
         #[arg(long, short)]
         force: bool,
+        /// Use device-code authentication for the Codex login (for remote or headless machines)
+        #[arg(long, short = 'd')]
+        device_auth: bool,
     },
     /// List saved credential names and mark the active one
     List,
@@ -213,7 +216,11 @@ fn dispatch(cli: Cli) -> Result<()> {
     let mut index = load_or_migrate_index(&path, &legacy_index_path()?)?;
 
     match cli.command {
-        Commands::Add { name, force } => add(&path, &mut index, &name, force),
+        Commands::Add {
+            name,
+            force,
+            device_auth,
+        } => add(&path, &mut index, &name, force, device_auth),
         Commands::List => list(&index),
         Commands::Set { name } => set(&path, &mut index, &name),
         Commands::Audit { json } => {
@@ -264,7 +271,7 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
         .map_err(|error| AppError(format!("could not start async runtime: {error}")))
 }
 
-fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
+fn add(path: &Path, index: &mut Index, name: &str, force: bool, device_auth: bool) -> Result<()> {
     validate_name(name)?;
     if index.contains(name) && !force {
         return Err(AppError(format!(
@@ -276,7 +283,12 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
     let mut choice = String::new();
     io::stdin().read_line(&mut choice)?;
     if choice.trim() == "2" {
-        return add_codex(path, index, name);
+        return add_codex(path, index, name, device_auth);
+    }
+    if device_auth {
+        return Err(AppError(
+            "--device-auth only applies to Codex logins; choose subscription type 2".into(),
+        ));
     }
     println!("Opening Claude Code login for credential \"{name}\"...");
     let oauth_scopes = requested_oauth_scopes(env::var_os(CLAUDE_OAUTH_SCOPES_ENV).as_deref());
@@ -314,7 +326,7 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn add_codex(path: &Path, index: &mut Index, name: &str) -> Result<()> {
+fn add_codex(path: &Path, index: &mut Index, name: &str, device_auth: bool) -> Result<()> {
     use rand::distr::{Alphanumeric, SampleString};
     let temporary_home = env::temp_dir().join(format!(
         "subhub-codex-login-{}",
@@ -324,8 +336,12 @@ fn add_codex(path: &Path, index: &mut Index, name: &str) -> Result<()> {
     fs::set_permissions(&temporary_home, fs::Permissions::from_mode(0o700))?;
     let auth_path = temporary_home.join("auth.json");
     println!("Opening Codex ChatGPT login for credential \"{name}\"...");
-    let status = Command::new("codex")
-        .args(["-c", "cli_auth_credentials_store=\"file\"", "login"])
+    let mut login = Command::new("codex");
+    login.args(["-c", "cli_auth_credentials_store=\"file\"", "login"]);
+    if device_auth {
+        login.arg("--device-auth");
+    }
+    let status = login
         .env("CODEX_HOME", &temporary_home)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())

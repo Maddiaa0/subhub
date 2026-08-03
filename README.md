@@ -33,7 +33,8 @@ To install from a local checkout, run `cargo install --path .`.
 `subhub add` prompts for Claude Code or Codex. Claude accounts are captured
 after the standard `claude auth login --claudeai` flow. Codex accounts are
 captured after a standard `codex login` ChatGPT flow in an isolated temporary
-credential cache. On macOS, tokens are stored in the login Keychain. On Linux,
+credential cache; pass `--device-auth` on remote or headless machines to use
+the device-code flow instead of a local browser. On macOS, tokens are stored in the login Keychain. On Linux,
 they are stored in `$XDG_CONFIG_HOME/subhub/credentials.json` (defaulting to
 `~/.config/subhub/credentials.json`) with user-only permissions. Tokens are
 never written to the Subhub index.
@@ -45,7 +46,9 @@ shared or made group/world-readable.
 ## Commands
 
 ```text
-subhub add <name> [--force]       Save or replace an account
+subhub add <name> [--force] [--device-auth]
+                                  Save or replace an account
+                                  (--device-auth: Codex device-code login)
 subhub list                       List accounts and their providers
 subhub set <name>                 Select an account
 subhub audit [--json]             Show subscription usage
