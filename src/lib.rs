@@ -147,7 +147,12 @@ enum GatewayCommands {
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct Index {
     version: u8,
+    /// Most recently activated credential, kept for older subhub binaries.
     active: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_claude: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_codex: Option<String>,
     credentials: Vec<String>,
 }
 
@@ -186,6 +191,8 @@ impl Index {
         Self {
             version: 1,
             active: None,
+            active_claude: None,
+            active_codex: None,
             credentials: Vec::new(),
         }
     }
@@ -194,12 +201,44 @@ impl Index {
         self.credentials.iter().any(|item| item == name)
     }
 
-    fn add(&mut self, name: &str) {
+    fn add(&mut self, name: &str, provider: Provider) {
         if !self.contains(name) {
             self.credentials.push(name.to_owned());
             self.credentials.sort();
         }
+        self.activate(name, provider);
+    }
+
+    fn activate(&mut self, name: &str, provider: Provider) {
         self.active = Some(name.to_owned());
+        *match provider {
+            Provider::Claude => &mut self.active_claude,
+            Provider::Codex => &mut self.active_codex,
+        } = Some(name.to_owned());
+    }
+
+    /// Active credential for a provider, falling back to the legacy single
+    /// slot for index files written before per-provider tracking.
+    fn active_for(&self, provider: Provider) -> Option<&str> {
+        match provider {
+            Provider::Claude => &self.active_claude,
+            Provider::Codex => &self.active_codex,
+        }
+        .as_deref()
+        .or(self.active.as_deref())
+    }
+
+    fn active_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for name in [&self.active_claude, &self.active_codex, &self.active]
+            .into_iter()
+            .flatten()
+        {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names
     }
 }
 
@@ -247,7 +286,7 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
                 reserve_percent,
                 audit_interval,
                 background,
-                initial_selected: index.active.clone(),
+                initial_selected: index.active_names(),
                 credentials,
             }))
         }
@@ -320,7 +359,7 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool, device_auth: boo
     })?;
     credential_write(VAULT_SERVICE, name, &vault_entry)?;
 
-    index.add(name);
+    index.add(name, Provider::Claude);
     save_index(path, index)?;
     println!("Saved \"{name}\" and made it active.");
     Ok(())
@@ -373,7 +412,7 @@ fn add_codex(path: &Path, index: &mut Index, name: &str, device_auth: bool) -> R
     })();
     fs::remove_dir_all(&temporary_home)?;
     capture?;
-    index.add(name);
+    index.add(name, Provider::Codex);
     save_index(path, index)?;
     println!("Saved Codex subscription \"{name}\".");
     Ok(())
@@ -386,11 +425,6 @@ fn list(index: &Index) -> Result<()> {
     }
 
     for name in &index.credentials {
-        let marker = if index.active.as_deref() == Some(name) {
-            "*"
-        } else {
-            " "
-        };
         let provider = vault_read(name)
             .ok()
             .and_then(|stored| serde_json::from_str::<Value>(&stored).ok())
@@ -401,6 +435,16 @@ fn list(index: &Index) -> Result<()> {
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| "claude".into());
+        let marker = if index.active_for(if provider == "codex" {
+            Provider::Codex
+        } else {
+            Provider::Claude
+        }) == Some(name)
+        {
+            "*"
+        } else {
+            " "
+        };
         println!("{marker} {name} [{provider}]");
     }
     Ok(())
@@ -431,7 +475,7 @@ fn set(path: &Path, index: &mut Index, name: &str) -> Result<()> {
         write_oauth_account(&entry.oauth_account)?;
     }
 
-    index.active = Some(name.to_owned());
+    index.activate(name, entry.provider);
     save_index(path, index)?;
     println!("Active credential set to \"{name}\".");
     match lifecycle::select_gateway_account(name) {
@@ -1064,10 +1108,27 @@ mod tests {
     #[test]
     fn adding_names_is_sorted_and_marks_active() {
         let mut index = Index::new();
-        index.add("work");
-        index.add("personal");
+        index.add("work", Provider::Codex);
+        index.add("personal", Provider::Claude);
         assert_eq!(index.credentials, ["personal", "work"]);
         assert_eq!(index.active.as_deref(), Some("personal"));
+        assert_eq!(index.active_for(Provider::Claude), Some("personal"));
+        assert_eq!(index.active_for(Provider::Codex), Some("work"));
+        assert_eq!(index.active_names(), ["personal", "work"]);
+    }
+
+    #[test]
+    fn legacy_index_active_slot_backs_both_providers() {
+        let index: Index =
+            serde_json::from_value(serde_json::json!({
+                "version": 1,
+                "active": "personal",
+                "credentials": ["personal"]
+            }))
+            .unwrap();
+        assert_eq!(index.active_for(Provider::Claude), Some("personal"));
+        assert_eq!(index.active_for(Provider::Codex), Some("personal"));
+        assert_eq!(index.active_names(), ["personal"]);
     }
 
     #[test]
@@ -1151,7 +1212,7 @@ mod tests {
         let path = directory.join("index.json");
 
         let mut index = Index::new();
-        index.add("personal");
+        index.add("personal", Provider::Claude);
         save_index(&path, &index).unwrap();
 
         let written = fs::read_to_string(&path).unwrap();
@@ -1161,6 +1222,7 @@ mod tests {
             serde_json::json!({
                 "version": 1,
                 "active": "personal",
+                "active_claude": "personal",
                 "credentials": ["personal"]
             })
         );
@@ -1193,7 +1255,7 @@ mod tests {
         let legacy_path = directory.join("legacy").join("index.json");
         let subhub_path = directory.join("subhub").join("index.json");
         let mut legacy = Index::new();
-        legacy.add("personal");
+        legacy.add("personal", Provider::Claude);
         save_index(&legacy_path, &legacy).unwrap();
 
         let migrated = load_or_migrate_index(&subhub_path, &legacy_path).unwrap();

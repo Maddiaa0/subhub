@@ -291,10 +291,20 @@ pub(crate) fn statusline() -> Result<()> {
 
 fn gateway_health() -> Result<Option<String>> {
     let body = fetch_gateway_status()?;
-    Ok(body
-        .get("selected")
-        .and_then(Value::as_str)
-        .map(str::to_owned))
+    let mut parts = Vec::new();
+    for provider in ["claude", "codex"] {
+        if let Some(name) = body
+            .pointer(&format!("/selected/{provider}"))
+            .and_then(Value::as_str)
+        {
+            parts.push(format!("{provider}: {name}"));
+        }
+    }
+    Ok(if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    })
 }
 
 fn fetch_gateway_status() -> Result<Value> {
@@ -318,40 +328,50 @@ fn fetch_gateway_status() -> Result<Value> {
 }
 
 fn format_statusline_segment(status: &Value) -> String {
-    let Some(selected) = status.get("selected").and_then(Value::as_str) else {
-        return "Subhub: auditing".into();
-    };
-    let usage = status
-        .get("credentials")
-        .and_then(|credentials| credentials.get(selected))
-        .and_then(|credential| credential.get("usage"));
-    let five = usage
-        .and_then(|usage| usage.get("five_hour"))
-        .and_then(|window| window.get("utilization"))
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            usage
-                .and_then(|usage| usage.pointer("/rate_limit/primary_window/used_percent"))
-                .and_then(Value::as_f64)
-        });
-    let seven = usage
-        .and_then(|usage| usage.get("seven_day"))
-        .and_then(|window| window.get("utilization"))
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            usage
-                .and_then(|usage| usage.pointer("/rate_limit/secondary_window/used_percent"))
-                .and_then(Value::as_f64)
-        });
+    let mut parts = Vec::new();
+    for (provider, label) in [("claude", "Subhub"), ("codex", "Codex")] {
+        let Some(selected) = status
+            .pointer(&format!("/selected/{provider}"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let usage = status
+            .get("credentials")
+            .and_then(|credentials| credentials.get(selected))
+            .and_then(|credential| credential.get("usage"));
+        let five = usage
+            .and_then(|usage| usage.get("five_hour"))
+            .and_then(|window| window.get("utilization"))
+            .and_then(Value::as_f64)
+            .or_else(|| {
+                usage
+                    .and_then(|usage| usage.pointer("/rate_limit/primary_window/used_percent"))
+                    .and_then(Value::as_f64)
+            });
+        let seven = usage
+            .and_then(|usage| usage.get("seven_day"))
+            .and_then(|window| window.get("utilization"))
+            .and_then(Value::as_f64)
+            .or_else(|| {
+                usage
+                    .and_then(|usage| usage.pointer("/rate_limit/secondary_window/used_percent"))
+                    .and_then(Value::as_f64)
+            });
 
-    let mut parts = vec![format!("Subhub: {selected}")];
-    if let Some(five) = five {
-        parts.push(format!("5h {five:.0}%"));
+        parts.push(format!("{label}: {selected}"));
+        if let Some(five) = five {
+            parts.push(format!("5h {five:.0}%"));
+        }
+        if let Some(seven) = seven {
+            parts.push(format!("7d {seven:.0}%"));
+        }
     }
-    if let Some(seven) = seven {
-        parts.push(format!("7d {seven:.0}%"));
+    if parts.is_empty() {
+        "Subhub: auditing".into()
+    } else {
+        parts.join(" | ")
     }
-    parts.join(" | ")
 }
 
 fn previous_statusline_output(input: &str) -> Result<String> {
@@ -1106,7 +1126,7 @@ mod tests {
     #[test]
     fn statusline_segment_shows_selected_account_and_usage() {
         let status = serde_json::json!({
-            "selected": "personal",
+            "selected": {"claude": "personal", "codex": null},
             "credentials": {
                 "personal": {
                     "usage": {
@@ -1121,8 +1141,27 @@ mod tests {
             "Subhub: personal | 5h 12% | 7d 35%"
         );
         assert_eq!(
-            format_statusline_segment(&serde_json::json!({"selected": null})),
+            format_statusline_segment(&serde_json::json!({"selected": {}})),
             "Subhub: auditing"
+        );
+    }
+
+    #[test]
+    fn statusline_segment_labels_each_provider() {
+        let status = serde_json::json!({
+            "selected": {"claude": "personal", "codex": "work"},
+            "credentials": {
+                "personal": {
+                    "usage": {"five_hour": {"utilization": 12.4}}
+                },
+                "work": {
+                    "usage": {"rate_limit": {"primary_window": {"used_percent": 55.0}}}
+                }
+            }
+        });
+        assert_eq!(
+            format_statusline_segment(&status),
+            "Subhub: personal | 5h 12% | Codex: work | 5h 55%"
         );
     }
 

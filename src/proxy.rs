@@ -22,8 +22,42 @@ pub(crate) struct ServeOptions {
     pub reserve_percent: f64,
     pub audit_interval: u64,
     pub background: bool,
-    pub initial_selected: Option<String>,
+    pub initial_selected: Vec<String>,
     pub credentials: Vec<StoredCredential>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct SelectedAccounts {
+    claude: Option<String>,
+    codex: Option<String>,
+}
+
+impl SelectedAccounts {
+    fn get(&self, provider: Provider) -> Option<String> {
+        self.slot_ref(provider).clone()
+    }
+
+    fn slot_ref(&self, provider: Provider) -> &Option<String> {
+        match provider {
+            Provider::Claude => &self.claude,
+            Provider::Codex => &self.codex,
+        }
+    }
+
+    fn slot(&mut self, provider: Provider) -> &mut Option<String> {
+        match provider {
+            Provider::Claude => &mut self.claude,
+            Provider::Codex => &mut self.codex,
+        }
+    }
+
+    fn clear_name(&mut self, name: &str) {
+        for slot in [&mut self.claude, &mut self.codex] {
+            if slot.as_deref() == Some(name) {
+                *slot = None;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -61,7 +95,7 @@ struct ProxyState {
     usage_client: UsageClient,
     credentials: Arc<Vec<StoredCredential>>,
     health: Arc<RwLock<HashMap<String, CredentialHealth>>>,
-    selected: Arc<Mutex<Option<String>>>,
+    selected: Arc<Mutex<SelectedAccounts>>,
     client_token: Arc<String>,
     reserve_percent: f64,
 }
@@ -101,12 +135,19 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| AppError(format!("could not build HTTP client: {error}")))?;
-    let initial_selected = options.initial_selected.filter(|name| {
-        options
+    let mut initial_selected = SelectedAccounts::default();
+    for name in options.initial_selected {
+        if let Some(credential) = options
             .credentials
             .iter()
-            .any(|credential| credential.name == *name)
-    });
+            .find(|credential| credential.name == name)
+        {
+            let slot = initial_selected.slot(credential.provider);
+            if slot.is_none() {
+                *slot = Some(name);
+            }
+        }
+    }
     let state = ProxyState {
         usage_client: UsageClient::new(client.clone(), claude_version().as_deref()),
         client,
@@ -175,14 +216,14 @@ async fn select_account(
 }
 
 async fn set_selected_account(state: &ProxyState, name: &str) -> bool {
-    if !state
+    let Some(credential) = state
         .credentials
         .iter()
-        .any(|credential| credential.name == name)
-    {
+        .find(|credential| credential.name == name)
+    else {
         return false;
-    }
-    *state.selected.lock().await = Some(name.to_owned());
+    };
+    *state.selected.lock().await.slot(credential.provider) = Some(name.to_owned());
     true
 }
 
@@ -345,7 +386,7 @@ async fn select_credential(
     provider: Provider,
 ) -> Option<StoredCredential> {
     let health = state.health.read().await;
-    let current = state.selected.lock().await.clone();
+    let current = state.selected.lock().await.get(provider);
     let eligible = |credential: &&StoredCredential| {
         credential.provider == provider
             && exclude != Some(credential.name.as_str())
@@ -372,7 +413,7 @@ async fn select_credential(
         })
         .cloned();
     if let Some(credential) = &selected {
-        *state.selected.lock().await = Some(credential.name.clone());
+        *state.selected.lock().await.slot(provider) = Some(credential.name.clone());
     }
     selected
 }
@@ -477,10 +518,7 @@ async fn mark_failed(state: &ProxyState, name: &str, status: StatusCode) {
             }
         }
     }
-    let mut selected = state.selected.lock().await;
-    if selected.as_deref() == Some(name) {
-        *selected = None;
-    }
+    state.selected.lock().await.clear_name(name);
 }
 
 fn into_axum_response(response: reqwest::Response) -> Response {
@@ -584,7 +622,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(selected.name, "ready");
-        assert_eq!(state.selected.lock().await.as_deref(), Some("ready"));
+        assert_eq!(state.selected.lock().await.claude.as_deref(), Some("ready"));
         let selected_again =
             select_credential(&state, Some("claude-sonnet"), None, Provider::Claude)
                 .await
@@ -596,9 +634,9 @@ mod tests {
     async fn manual_selection_updates_known_account_only() {
         let state = test_state();
         assert!(set_selected_account(&state, "ready").await);
-        assert_eq!(state.selected.lock().await.as_deref(), Some("ready"));
+        assert_eq!(state.selected.lock().await.claude.as_deref(), Some("ready"));
         assert!(!set_selected_account(&state, "missing").await);
-        assert_eq!(state.selected.lock().await.as_deref(), Some("ready"));
+        assert_eq!(state.selected.lock().await.claude.as_deref(), Some("ready"));
     }
 
     #[tokio::test]
@@ -631,6 +669,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(selected.name, "codex");
+    }
+
+    #[tokio::test]
+    async fn each_provider_keeps_its_own_selection() {
+        let mut state = test_state();
+        Arc::make_mut(&mut state.credentials).push(StoredCredential {
+            name: "codex".into(),
+            access_token: "secret-c".into(),
+            scopes: Vec::new(),
+            provider: Provider::Codex,
+            account_id: Some("account-c".into()),
+        });
+        state.health.write().await.insert(
+            "codex".into(),
+            CredentialHealth {
+                usage: Some(CredentialUsage::Codex(
+                    serde_json::from_value(serde_json::json!({
+                        "rate_limit": {
+                            "primary_window": {"used_percent": 10.0, "reset_at": 1}
+                        }
+                    }))
+                    .unwrap(),
+                )),
+                error: None,
+                checked_at: 1,
+            },
+        );
+        select_credential(&state, Some("claude-sonnet"), None, Provider::Claude).await;
+        select_credential(&state, None, None, Provider::Codex).await;
+        let selected = state.selected.lock().await.clone();
+        assert_eq!(selected.claude.as_deref(), Some("ready"));
+        assert_eq!(selected.codex.as_deref(), Some("codex"));
+
+        mark_failed(&state, "codex", StatusCode::UNAUTHORIZED).await;
+        let selected = state.selected.lock().await.clone();
+        assert_eq!(selected.claude.as_deref(), Some("ready"));
+        assert_eq!(selected.codex, None);
     }
 
     #[test]
