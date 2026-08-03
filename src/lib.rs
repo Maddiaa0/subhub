@@ -362,7 +362,20 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool, device_auth: boo
     index.add(name, Provider::Claude);
     save_index(path, index)?;
     println!("Saved \"{name}\" and made it active.");
+    notify_gateway_reload();
     Ok(())
+}
+
+/// A running gateway holds an in-memory vault snapshot, so a fresh login is
+/// invisible to it until it reloads.
+fn notify_gateway_reload() {
+    match lifecycle::reload_gateway_accounts() {
+        Ok(true) => println!("Running gateway reloaded credentials."),
+        Ok(false) => {}
+        Err(error) => eprintln!(
+            "warning: running gateway did not reload credentials: {error}; run `subhub gateway restart` to pick up this login"
+        ),
+    }
 }
 
 fn add_codex(path: &Path, index: &mut Index, name: &str, device_auth: bool) -> Result<()> {
@@ -415,6 +428,7 @@ fn add_codex(path: &Path, index: &mut Index, name: &str, device_auth: bool) -> R
     index.add(name, Provider::Codex);
     save_index(path, index)?;
     println!("Saved Codex subscription \"{name}\".");
+    notify_gateway_reload();
     Ok(())
 }
 
@@ -496,6 +510,13 @@ fn decode_vault_entry(stored: &str) -> Result<(String, Value)> {
         serde_json::to_string(&entry.credential)?,
         entry.oauth_account,
     ))
+}
+
+/// Fresh vault snapshot for the gateway's `/_subhub/reload` endpoint.
+pub(crate) fn gateway_credentials() -> Result<Vec<StoredCredential>> {
+    let path = index_path()?;
+    let index = load_or_migrate_index(&path, &legacy_index_path()?)?;
+    stored_credentials(&index)
 }
 
 fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {

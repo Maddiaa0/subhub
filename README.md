@@ -112,4 +112,6 @@ subhub gateway uninstall --purge
 ```
 
 OAuth refresh remains delegated to the provider CLIs. Re-add an expired account
-with `subhub add <name> --force`.
+with `subhub add <name> --force`. A running gateway is told to reload its
+credentials after every `subhub add`, so new logins are routable immediately
+without a restart.

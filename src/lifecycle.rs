@@ -72,6 +72,37 @@ pub(crate) fn select_gateway_account(name: &str) -> Result<bool> {
     })
 }
 
+/// Ask a running gateway to re-read the vault. Returns Ok(false) when no
+/// gateway is reachable, and an error when one is reachable but refuses.
+pub(crate) fn reload_gateway_accounts() -> Result<bool> {
+    let Ok(token) = read_gateway_token() else {
+        return Ok(false);
+    };
+    crate::runtime()?.block_on(async move {
+        let response = match reqwest::Client::new()
+            .post(format!("{BASE_URL}/_subhub/reload"))
+            .bearer_auth(token)
+            // The gateway audits every credential before replying.
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => return Ok(false),
+        };
+        if response.status().is_success() {
+            Ok(true)
+        } else {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            Err(AppError(format!(
+                "gateway returned {status}: {}",
+                body.chars().take(200).collect::<String>()
+            )))
+        }
+    })
+}
+
 fn ensure_gateway_token() -> Result<String> {
     if let Ok(token) = read_gateway_token()
         && !token.is_empty()

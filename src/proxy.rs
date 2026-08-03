@@ -58,6 +58,14 @@ impl SelectedAccounts {
             }
         }
     }
+
+    fn retain_names(&mut self, names: &[String]) {
+        for slot in [&mut self.claude, &mut self.codex] {
+            if slot.as_ref().is_some_and(|name| !names.contains(name)) {
+                *slot = None;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -93,7 +101,7 @@ impl CredentialUsage {
 struct ProxyState {
     client: reqwest::Client,
     usage_client: UsageClient,
-    credentials: Arc<Vec<StoredCredential>>,
+    credentials: Arc<RwLock<Vec<StoredCredential>>>,
     health: Arc<RwLock<HashMap<String, CredentialHealth>>>,
     selected: Arc<Mutex<SelectedAccounts>>,
     client_token: Arc<String>,
@@ -151,7 +159,7 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
     let state = ProxyState {
         usage_client: UsageClient::new(client.clone(), claude_version().as_deref()),
         client,
-        credentials: Arc::new(options.credentials),
+        credentials: Arc::new(RwLock::new(options.credentials)),
         health: Arc::default(),
         selected: Arc::new(Mutex::new(initial_selected)),
         client_token: Arc::new(client_token.clone()),
@@ -170,6 +178,7 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
     let app = Router::new()
         .route("/_subhub/status", axum::routing::get(status))
         .route("/_subhub/select", axum::routing::post(select_account))
+        .route("/_subhub/reload", axum::routing::post(reload_accounts))
         .route("/{*path}", any(proxy))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(address)
@@ -216,19 +225,61 @@ async fn select_account(
 }
 
 async fn set_selected_account(state: &ProxyState, name: &str) -> bool {
-    let Some(credential) = state
+    let Some(provider) = state
         .credentials
+        .read()
+        .await
         .iter()
         .find(|credential| credential.name == name)
+        .map(|credential| credential.provider)
     else {
         return false;
     };
-    *state.selected.lock().await.slot(credential.provider) = Some(name.to_owned());
+    *state.selected.lock().await.slot(provider) = Some(name.to_owned());
     true
 }
 
+/// Re-read the index and vault so logins performed while the gateway is
+/// running become routable without a restart.
+async fn reload_accounts(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
+    if !authorized(&state, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "invalid local proxy token");
+    }
+    let loaded = match tokio::task::spawn_blocking(crate::gateway_credentials).await {
+        Ok(Ok(credentials)) => credentials,
+        Ok(Err(error)) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    if loaded.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "no credentials saved; run `subhub add <name>`",
+        );
+    }
+    let names: Vec<String> = loaded
+        .iter()
+        .map(|credential| credential.name.clone())
+        .collect();
+    // Each lock is taken and released on its own so this can never deadlock
+    // with request handlers that hold another of these locks.
+    *state.credentials.write().await = loaded;
+    state
+        .health
+        .write()
+        .await
+        .retain(|name, _| names.contains(name));
+    state.selected.lock().await.retain_names(&names);
+    // Audit before replying: a credential without usage data is unroutable,
+    // so the caller may treat a successful reload as "ready to serve".
+    audit_all(&state).await;
+    json_response(StatusCode::OK, serde_json::json!({"credentials": names}))
+}
+
 async fn audit_all(state: &ProxyState) {
-    for credential in state.credentials.iter() {
+    let credentials = state.credentials.read().await.clone();
+    for credential in &credentials {
         let result = if credential.provider == Provider::Codex {
             match credential.account_id.as_deref() {
                 Some(account) => {
@@ -385,6 +436,7 @@ async fn select_credential(
     exclude: Option<&str>,
     provider: Provider,
 ) -> Option<StoredCredential> {
+    let credentials = state.credentials.read().await.clone();
     let health = state.health.read().await;
     let current = state.selected.lock().await.get(provider);
     let eligible = |credential: &&StoredCredential| {
@@ -396,16 +448,14 @@ async fn select_credential(
                 .is_some_and(|usage| usage.eligible(model, state.reserve_percent))
     };
     if let Some(name) = current
-        && let Some(credential) = state
-            .credentials
+        && let Some(credential) = credentials
             .iter()
             .find(|credential| credential.name == name)
             .filter(eligible)
     {
         return Some(credential.clone());
     }
-    let selected = state
-        .credentials
+    let selected = credentials
         .iter()
         .filter(eligible)
         .min_by(|a, b| {
@@ -565,7 +615,7 @@ mod tests {
         ProxyState {
             usage_client: UsageClient::new(client.clone(), None),
             client,
-            credentials: Arc::new(vec![
+            credentials: Arc::new(RwLock::new(vec![
                 StoredCredential {
                     name: "full".into(),
                     access_token: "secret-a".into(),
@@ -580,7 +630,7 @@ mod tests {
                     provider: Provider::Claude,
                     account_id: None,
                 },
-            ]),
+            ])),
             health: Arc::new(RwLock::new(HashMap::from([
                 (
                     "full".into(),
@@ -641,8 +691,8 @@ mod tests {
 
     #[tokio::test]
     async fn provider_selection_never_crosses_subscription_types() {
-        let mut state = test_state();
-        Arc::make_mut(&mut state.credentials).push(StoredCredential {
+        let state = test_state();
+        state.credentials.write().await.push(StoredCredential {
             name: "codex".into(),
             access_token: "secret-c".into(),
             scopes: Vec::new(),
@@ -673,8 +723,8 @@ mod tests {
 
     #[tokio::test]
     async fn each_provider_keeps_its_own_selection() {
-        let mut state = test_state();
-        Arc::make_mut(&mut state.credentials).push(StoredCredential {
+        let state = test_state();
+        state.credentials.write().await.push(StoredCredential {
             name: "codex".into(),
             access_token: "secret-c".into(),
             scopes: Vec::new(),
@@ -705,6 +755,17 @@ mod tests {
         mark_failed(&state, "codex", StatusCode::UNAUTHORIZED).await;
         let selected = state.selected.lock().await.clone();
         assert_eq!(selected.claude.as_deref(), Some("ready"));
+        assert_eq!(selected.codex, None);
+    }
+
+    #[test]
+    fn reload_drops_selections_for_removed_credentials() {
+        let mut selected = SelectedAccounts {
+            claude: Some("kept".into()),
+            codex: Some("removed".into()),
+        };
+        selected.retain_names(&["kept".to_string()]);
+        assert_eq!(selected.claude.as_deref(), Some("kept"));
         assert_eq!(selected.codex, None);
     }
 
