@@ -386,6 +386,18 @@ async fn record_audit(
     credential: &StoredCredential,
     result: Result<CredentialUsage>,
 ) {
+    crate::observability::event(
+        if result.is_ok() {
+            "audit_succeeded"
+        } else {
+            "audit_failed"
+        },
+        serde_json::json!({
+            "credential": credential.name,
+            "provider": credential.provider,
+            "error": result.as_ref().err().map(|error| safe_error(error.to_string()))
+        }),
+    );
     let mut health = state.health.write().await;
     let previous_usage = health
         .get(&credential.name)
@@ -394,6 +406,10 @@ async fn record_audit(
         credential.name.clone(),
         audit_health(previous_usage, result),
     );
+}
+
+fn safe_error(error: String) -> String {
+    error.chars().take(300).collect()
 }
 
 async fn refresh_credential(
@@ -422,6 +438,10 @@ async fn refresh_credential(
     let refreshed = match crate::refresh_claude_credential(&state.client, name).await {
         Ok(refreshed) => {
             state.refresh_backoff.lock().await.remove(name);
+            crate::observability::event(
+                "refresh_succeeded",
+                serde_json::json!({"credential": name, "provider": "claude"}),
+            );
             refreshed
         }
         Err(error) => {
@@ -437,6 +457,15 @@ async fn refresh_credential(
                     failures,
                     retry_at: now() + delay.min(1_800) + jitter,
                 },
+            );
+            crate::observability::event(
+                "refresh_failed",
+                serde_json::json!({
+                    "credential": name,
+                    "provider": "claude",
+                    "retry_at": now() + delay.min(1_800) + jitter,
+                    "error": safe_error(error.to_string())
+                }),
             );
             return Err(error);
         }

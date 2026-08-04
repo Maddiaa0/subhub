@@ -297,6 +297,42 @@ pub(crate) fn status(provider: Option<crate::Provider>) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn logs(lines: usize) -> Result<()> {
+    let records = crate::observability::tail(lines)?;
+    if records.is_empty() {
+        println!("No gateway events recorded yet.");
+    } else {
+        for record in records {
+            println!("{record}");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn doctor() -> Result<()> {
+    status(None)?;
+    let status = fetch_gateway_status();
+    match status {
+        Ok(status) => {
+            let unavailable = status
+                .get("credentials")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter(|(_, health)| health.get("usage").is_none_or(Value::is_null))
+                .count();
+            if unavailable == 0 {
+                println!("Doctor:    healthy");
+            } else {
+                println!("Doctor:    {unavailable} credential(s) need attention");
+                println!("Next:      subhub gateway logs --lines 20");
+            }
+        }
+        Err(error) => println!("Doctor:    gateway check failed ({error})"),
+    }
+    Ok(())
+}
+
 fn print_gateway_health(status: &Value, provider_filter: Option<crate::Provider>) {
     println!("Gateway:   reachable");
     let selected = status.get("selected").and_then(Value::as_object);

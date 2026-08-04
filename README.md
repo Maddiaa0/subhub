@@ -58,6 +58,8 @@ subhub gateway install            Install and start the background gateway
 subhub gateway reinstall          Uninstall then install, preserving accounts
 subhub gateway status [--provider claude|codex]
                                   Show gateway health, optionally filtered
+subhub gateway logs [--lines 100] Show structured gateway events
+subhub gateway doctor             Diagnose routing and credential health
 subhub gateway start|stop|restart Manage the gateway
 subhub gateway uninstall [--purge]
 subhub gateway serve              Run the gateway in the foreground
