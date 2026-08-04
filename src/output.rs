@@ -1,5 +1,5 @@
 use crate::gateway::protocol::{CredentialUsage, GatewayStatus};
-use crate::provider::{Provider, provider_name};
+use crate::provider::Provider;
 
 pub(crate) fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
@@ -15,7 +15,7 @@ pub(crate) fn print_gateway_health(status: &GatewayStatus, provider_filter: Opti
         if provider_filter.is_some_and(|filter| report.provider != Some(filter)) {
             continue;
         }
-        let provider = report.provider.map_or("unknown", provider_name);
+        let provider = report.provider.map_or("unknown", Provider::name);
         let active = report
             .provider
             .is_some_and(|provider| status.selected.for_provider(provider) == Some(name));
