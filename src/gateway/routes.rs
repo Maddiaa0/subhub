@@ -1,3 +1,6 @@
+//! HTTP handlers: the admin endpoints (`/_subhub/*`) and the forwarding
+//! proxy, including the 401/429 retry-with-another-credential paths.
+
 use super::audit::audit_all;
 use super::protocol::{CredentialReport, GatewayStatus, SelectedReport, TokenState};
 use super::refresh::refresh_credential;

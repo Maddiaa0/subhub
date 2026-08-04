@@ -1,3 +1,5 @@
+//! HTTP client for the running gateway's local admin endpoints.
+
 use super::BASE_URL;
 use crate::gateway::protocol::GatewayStatus;
 use crate::{Error, Result, credential_read};

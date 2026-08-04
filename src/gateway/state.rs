@@ -1,3 +1,5 @@
+//! Shared gateway state and small helpers used across gateway submodules.
+
 use super::protocol::CredentialUsage;
 use crate::error::CredentialError;
 use crate::provider::{Provider, StoredCredential};

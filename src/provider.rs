@@ -1,3 +1,6 @@
+//! The provider seam: [`Provider`] and every behavior that differs between
+//! Claude and Codex.
+
 use crate::codex;
 use serde::{Deserialize, Serialize};
 

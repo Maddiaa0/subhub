@@ -1,3 +1,6 @@
+//! Crate-wide typed errors. Routing decisions depend on error *kinds*
+//! (refresh vs transient vs fatal audit), never on matching message text.
+
 use serde::{Deserialize, Serialize};
 
 pub type Result<T> = std::result::Result<T, Error>;

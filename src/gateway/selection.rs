@@ -1,3 +1,6 @@
+//! Credential selection: sticky per-provider choice, utilization-based
+//! rebalancing, the advisory-audit fallback, and routing diagnostics.
+
 use super::protocol::CredentialUsage;
 use super::state::{CredentialHealth, ProxyState};
 use crate::error::{CredentialError, ErrorKind};

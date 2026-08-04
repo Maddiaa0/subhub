@@ -1,3 +1,7 @@
+//! Installed-gateway lifecycle: install/uninstall (with surgical settings
+//! restore), start/stop/restart, and the status/logs/doctor/statusline
+//! commands.
+
 mod claude_settings;
 mod codex_config;
 mod gateway_client;

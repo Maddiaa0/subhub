@@ -1,3 +1,6 @@
+//! Structured gateway event log: append-only JSONL under the config
+//! directory, read back by `subhub gateway logs`.
+
 use serde_json::Value;
 use std::fs;
 use std::io::Write;

@@ -1,3 +1,6 @@
+//! Proactive OAuth refresh: a scheduler that refreshes soon-to-expire
+//! tokens with per-credential exponential backoff on failure.
+
 use super::state::{ProxyState, RefreshBackoff, now, safe_error};
 use crate::provider::StoredCredential;
 use crate::{Result, refresh_claude_credential};

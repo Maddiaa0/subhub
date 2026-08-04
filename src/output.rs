@@ -1,3 +1,6 @@
+//! Terminal rendering shared by CLI commands: gateway health listings and
+//! the Claude Code status-line segment.
+
 use crate::gateway::protocol::{CredentialUsage, GatewayStatus};
 use crate::provider::Provider;
 
