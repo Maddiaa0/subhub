@@ -1,4 +1,5 @@
 use super::audit::audit_all;
+use super::protocol::{CredentialReport, GatewayStatus, SelectedReport, TokenState};
 use super::refresh::refresh_credential;
 use super::selection::{
     mark_failed, routing_error_message, select_credential, set_selected_account,
@@ -85,36 +86,41 @@ pub(super) async fn status(State(state): State<ProxyState>, headers: HeaderMap) 
     if !authorized(&state, &headers) {
         return error_response(StatusCode::UNAUTHORIZED, "invalid local proxy token");
     }
-    let mut credentials = serde_json::to_value(state.health.read().await.clone())
-        .unwrap_or_else(|_| serde_json::json!({}));
-    if let Some(entries) = credentials.as_object_mut() {
-        let now = chrono::Utc::now().timestamp_millis();
-        for credential in state.credentials.read().await.iter() {
-            if let Some(entry) = entries
-                .get_mut(&credential.name)
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                let token_state = match credential.expires_at {
-                    Some(expires_at) if expires_at <= now => "expired",
-                    Some(expires_at) if expires_at <= now + 60_000 => "refresh_due",
-                    Some(_) => "valid",
-                    None => "unknown",
-                };
-                entry.insert("token_state".into(), token_state.into());
-                entry.insert("token_expires_at".into(), credential.expires_at.into());
-                entry.insert(
-                    "provider".into(),
-                    serde_json::to_value(credential.provider).unwrap_or_default(),
-                );
-            }
-        }
-    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let stored = state.credentials.read().await.clone();
+    let health = state.health.read().await.clone();
+    let credentials = health
+        .into_iter()
+        .map(|(name, entry)| {
+            let credential = stored.iter().find(|credential| credential.name == name);
+            let token_state = match credential.and_then(|credential| credential.expires_at) {
+                Some(expires_at) if expires_at <= now => TokenState::Expired,
+                Some(expires_at) if expires_at <= now + 60_000 => TokenState::RefreshDue,
+                Some(_) => TokenState::Valid,
+                None => TokenState::Unknown,
+            };
+            let report = CredentialReport {
+                provider: credential.map(|credential| credential.provider),
+                token_state,
+                token_expires_at: credential.and_then(|credential| credential.expires_at),
+                usage: entry.usage,
+                error: entry.error,
+                checked_at: entry.checked_at,
+            };
+            (name, report)
+        })
+        .collect();
+    let selected = state.selected.lock().await.clone();
+    let status = GatewayStatus {
+        selected: SelectedReport {
+            claude: selected.claude,
+            codex: selected.codex,
+        },
+        credentials,
+    };
     json_response(
         StatusCode::OK,
-        serde_json::json!({
-            "selected": state.selected.lock().await.clone(),
-            "credentials": credentials
-        }),
+        serde_json::to_value(&status).unwrap_or_default(),
     )
 }
 

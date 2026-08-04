@@ -1,4 +1,5 @@
 mod audit;
+pub(crate) mod protocol;
 mod refresh;
 mod routes;
 mod selection;

@@ -1,7 +1,7 @@
-use crate::codex;
+use super::protocol::CredentialUsage;
 use crate::error::CredentialError;
 use crate::provider::{Provider, StoredCredential};
-use crate::usage::{UsageClient, UsageSnapshot};
+use crate::usage::UsageClient;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,28 +55,6 @@ pub(crate) struct CredentialHealth {
     pub(crate) usage: Option<CredentialUsage>,
     pub(crate) error: Option<CredentialError>,
     pub(crate) checked_at: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-pub(crate) enum CredentialUsage {
-    Claude(UsageSnapshot),
-    Codex(codex::UsageSnapshot),
-}
-
-impl CredentialUsage {
-    pub(crate) fn eligible(&self, model: Option<&str>, reserve: f64) -> bool {
-        match self {
-            Self::Claude(usage) => usage.eligible(model, reserve),
-            Self::Codex(usage) => usage.eligible(reserve),
-        }
-    }
-    pub(crate) fn utilization(&self, model: Option<&str>) -> f64 {
-        match self {
-            Self::Claude(usage) => usage.tightest_utilization(model).unwrap_or(0.0),
-            Self::Codex(usage) => usage.tightest_utilization(),
-        }
-    }
 }
 
 #[derive(Clone)]
