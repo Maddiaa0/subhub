@@ -181,6 +181,7 @@ pub(crate) enum Provider {
 pub(crate) struct StoredCredential {
     pub name: String,
     pub access_token: String,
+    pub expires_at: Option<i64>,
     pub scopes: Vec<String>,
     pub provider: Provider,
     pub account_id: Option<String>,
@@ -560,6 +561,9 @@ fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
         credentials.push(StoredCredential {
             name: name.clone(),
             access_token: access_token.to_owned(),
+            expires_at: oauth
+                .and_then(|value| value.get("expiresAt"))
+                .and_then(Value::as_i64),
             scopes,
             provider,
             account_id: credential
@@ -569,6 +573,96 @@ fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
         });
     }
     Ok(credentials)
+}
+
+const CLAUDE_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+#[derive(Deserialize)]
+struct ClaudeRefreshResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: i64,
+}
+
+pub(crate) async fn refresh_claude_credential(
+    client: &reqwest::Client,
+    name: &str,
+) -> Result<StoredCredential> {
+    let stored = vault_read(name)?;
+    let mut entry: VaultEntry = serde_json::from_str(&stored)?;
+    if entry.provider != Provider::Claude {
+        return Err(AppError(format!(
+            "credential \"{name}\" is not a Claude credential"
+        )));
+    }
+    let oauth = entry
+        .credential
+        .get_mut("claudeAiOauth")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| AppError(format!("credential \"{name}\" has no Claude OAuth data")))?;
+    let refresh_token = oauth
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| AppError(format!("credential \"{name}\" has no refresh token")))?
+        .to_owned();
+    let response = client
+        .post(CLAUDE_TOKEN_URL)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header(
+            "user-agent",
+            format!(
+                "claude-code/{}",
+                claude_version().as_deref().unwrap_or("2.1.0")
+            ),
+        )
+        .json(&serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLAUDE_CLIENT_ID
+        }))
+        .send()
+        .await
+        .map_err(|error| AppError(format!("Claude OAuth refresh request failed: {error}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(AppError(format!(
+            "Claude OAuth refresh returned {status}: {}",
+            body.chars().take(300).collect::<String>()
+        )));
+    }
+    let refreshed: ClaudeRefreshResponse = response
+        .json()
+        .await
+        .map_err(|error| AppError(format!("invalid Claude OAuth refresh response: {error}")))?;
+    if refreshed.access_token.is_empty() || refreshed.expires_in <= 0 {
+        return Err(AppError(
+            "Claude OAuth refresh returned invalid token data".into(),
+        ));
+    }
+    oauth.insert("accessToken".into(), Value::String(refreshed.access_token));
+    if let Some(refresh_token) = refreshed.refresh_token.filter(|token| !token.is_empty()) {
+        oauth.insert("refreshToken".into(), Value::String(refresh_token));
+    }
+    let expires_at = chrono::Utc::now().timestamp_millis() + refreshed.expires_in * 1000;
+    oauth.insert("expiresAt".into(), Value::Number(expires_at.into()));
+
+    let encoded = serde_json::to_string(&entry)?;
+    credential_write(VAULT_SERVICE, name, &encoded)?;
+    let index = load_or_migrate_index(&index_path()?, &legacy_index_path()?)?;
+    if index.active_for(Provider::Claude) == Some(name) {
+        credential_write(
+            ACTIVE_SERVICE,
+            &current_user()?,
+            &serde_json::to_string(&entry.credential)?,
+        )?;
+    }
+    gateway_credentials()?
+        .into_iter()
+        .find(|credential| credential.name == name)
+        .ok_or_else(|| AppError(format!("refreshed credential \"{name}\" disappeared")))
 }
 
 #[derive(Serialize)]

@@ -111,7 +111,10 @@ credentials, its gateway token, and its local index, run:
 subhub gateway uninstall --purge
 ```
 
-OAuth refresh remains delegated to the provider CLIs. Re-add an expired account
-with `subhub add <name> --force`. A running gateway is told to reload its
-credentials after every `subhub add`, so new logins are routable immediately
-without a restart.
+The gateway refreshes Claude OAuth credentials shortly before access-token
+expiry and retries one pre-stream request after refreshing on an upstream 401.
+Rotated access and refresh tokens are persisted back to secure storage. Re-add
+an account with `subhub add <name> --force` only when its refresh token has also
+expired or been revoked. A running gateway is told to reload its credentials
+after every `subhub add`, so new logins are routable immediately without a
+restart.

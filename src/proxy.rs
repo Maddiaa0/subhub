@@ -104,6 +104,7 @@ struct ProxyState {
     credentials: Arc<RwLock<Vec<StoredCredential>>>,
     health: Arc<RwLock<HashMap<String, CredentialHealth>>>,
     selected: Arc<Mutex<SelectedAccounts>>,
+    refresh_lock: Arc<Mutex<()>>,
     client_token: Arc<String>,
     reserve_percent: f64,
 }
@@ -162,6 +163,7 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         credentials: Arc::new(RwLock::new(options.credentials)),
         health: Arc::default(),
         selected: Arc::new(Mutex::new(initial_selected)),
+        refresh_lock: Arc::default(),
         client_token: Arc::new(client_token.clone()),
         reserve_percent: options.reserve_percent,
     };
@@ -280,7 +282,21 @@ async fn reload_accounts(State(state): State<ProxyState>, headers: HeaderMap) ->
 async fn audit_all(state: &ProxyState) {
     let credentials = state.credentials.read().await.clone();
     for credential in &credentials {
-        let result = if credential.provider == Provider::Codex {
+        let credential = if credential.provider == Provider::Claude
+            && credential.expires_at.is_some_and(|expires_at| {
+                expires_at <= chrono::Utc::now().timestamp_millis() + 60_000
+            }) {
+            match refresh_credential(state, &credential.name, false, None).await {
+                Ok(credential) => credential,
+                Err(error) => {
+                    record_audit(state, credential, Err(error)).await;
+                    continue;
+                }
+            }
+        } else {
+            credential.clone()
+        };
+        let mut result = if credential.provider == Provider::Codex {
             match credential.account_id.as_deref() {
                 Some(account) => {
                     codex::fetch_usage(&state.client, &credential.access_token, account)
@@ -303,15 +319,77 @@ async fn audit_all(state: &ProxyState) {
                 .await
                 .map(CredentialUsage::Claude)
         };
-        let mut health = state.health.write().await;
-        let previous_usage = health
-            .get(&credential.name)
-            .and_then(|entry| entry.usage.clone());
-        health.insert(
-            credential.name.clone(),
-            audit_health(previous_usage, result),
-        );
+        if credential.provider == Provider::Claude
+            && result
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("unauthorized"))
+            && let Ok(refreshed) = refresh_credential(
+                state,
+                &credential.name,
+                true,
+                Some(&credential.access_token),
+            )
+            .await
+        {
+            result = state
+                .usage_client
+                .fetch(&refreshed.access_token)
+                .await
+                .map(CredentialUsage::Claude);
+        }
+        record_audit(state, &credential, result).await;
     }
+}
+
+async fn record_audit(
+    state: &ProxyState,
+    credential: &StoredCredential,
+    result: Result<CredentialUsage>,
+) {
+    let mut health = state.health.write().await;
+    let previous_usage = health
+        .get(&credential.name)
+        .and_then(|entry| entry.usage.clone());
+    health.insert(
+        credential.name.clone(),
+        audit_health(previous_usage, result),
+    );
+}
+
+async fn refresh_credential(
+    state: &ProxyState,
+    name: &str,
+    force: bool,
+    expected_access_token: Option<&str>,
+) -> Result<StoredCredential> {
+    let _guard = state.refresh_lock.lock().await;
+    // Another task may have completed the refresh while this one waited.
+    if let Some(current) = state
+        .credentials
+        .read()
+        .await
+        .iter()
+        .find(|credential| credential.name == name)
+        .cloned()
+        && ((!force
+            && current.expires_at.is_none_or(|expires_at| {
+                expires_at > chrono::Utc::now().timestamp_millis() + 60_000
+            }))
+            || expected_access_token.is_some_and(|expected| current.access_token != expected))
+    {
+        return Ok(current);
+    }
+    let refreshed = crate::refresh_claude_credential(&state.client, name).await?;
+    if let Some(current) = state
+        .credentials
+        .write()
+        .await
+        .iter_mut()
+        .find(|credential| credential.name == name)
+    {
+        *current = refreshed.clone();
+    }
+    Ok(refreshed)
 }
 
 fn audit_health(
@@ -393,12 +471,32 @@ async fn proxy(State(state): State<ProxyState>, request: Request) -> Response {
         }
     };
     match forward(&state, &parts, bytes.clone(), &first).await {
-        Ok(response)
-            if matches!(
-                response.status(),
-                StatusCode::UNAUTHORIZED | StatusCode::TOO_MANY_REQUESTS
-            ) =>
-        {
+        Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
+            if first.provider == Provider::Claude
+                && let Ok(refreshed) =
+                    refresh_credential(&state, &first.name, true, Some(&first.access_token)).await
+            {
+                return forward(&state, &parts, bytes, &refreshed)
+                    .await
+                    .map(into_axum_response)
+                    .unwrap_or_else(|error| {
+                        error_response(StatusCode::BAD_GATEWAY, &error.to_string())
+                    });
+            }
+            mark_failed(&state, &first.name, StatusCode::UNAUTHORIZED).await;
+            if let Some(second) =
+                select_credential(&state, model.as_deref(), Some(&first.name), provider).await
+            {
+                return forward(&state, &parts, bytes, &second)
+                    .await
+                    .map(into_axum_response)
+                    .unwrap_or_else(|error| {
+                        error_response(StatusCode::BAD_GATEWAY, &error.to_string())
+                    });
+            }
+            into_axum_response(response)
+        }
+        Ok(response) if response.status() == StatusCode::TOO_MANY_REQUESTS => {
             let status = response.status();
             mark_failed(&state, &first.name, status).await;
             if let Some(second) =
@@ -619,6 +717,7 @@ mod tests {
                 StoredCredential {
                     name: "full".into(),
                     access_token: "secret-a".into(),
+                    expires_at: None,
                     scopes: vec!["user:profile".into()],
                     provider: Provider::Claude,
                     account_id: None,
@@ -626,6 +725,7 @@ mod tests {
                 StoredCredential {
                     name: "ready".into(),
                     access_token: "secret-b".into(),
+                    expires_at: None,
                     scopes: vec!["user:profile".into()],
                     provider: Provider::Claude,
                     account_id: None,
@@ -660,6 +760,7 @@ mod tests {
                 ),
             ]))),
             selected: Arc::default(),
+            refresh_lock: Arc::default(),
             client_token: Arc::new("local-secret".into()),
             reserve_percent: 1.0,
         }
@@ -695,6 +796,7 @@ mod tests {
         state.credentials.write().await.push(StoredCredential {
             name: "codex".into(),
             access_token: "secret-c".into(),
+            expires_at: None,
             scopes: Vec::new(),
             provider: Provider::Codex,
             account_id: Some("account-c".into()),
@@ -727,6 +829,7 @@ mod tests {
         state.credentials.write().await.push(StoredCredential {
             name: "codex".into(),
             access_token: "secret-c".into(),
+            expires_at: None,
             scopes: Vec::new(),
             provider: Provider::Codex,
             account_id: Some("account-c".into()),
