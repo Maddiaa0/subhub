@@ -1,6 +1,7 @@
+use crate::error::{CredentialError, ErrorKind};
 use crate::lifecycle;
 use crate::usage::{UsageClient, UsageSnapshot};
-use crate::{AppError, Provider, Result, StoredCredential, claude_version, codex};
+use crate::{Error, Provider, Result, StoredCredential, claude_version, codex};
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
@@ -71,7 +72,7 @@ impl SelectedAccounts {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CredentialHealth {
     usage: Option<CredentialUsage>,
-    error: Option<String>,
+    error: Option<CredentialError>,
     checked_at: u64,
 }
 
@@ -118,19 +119,21 @@ struct RefreshBackoff {
 
 pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
     if options.credentials.is_empty() {
-        return Err(AppError(
+        return Err(Error::Message(
             "no credentials saved; run `subhub add <name>`".into(),
         ));
     }
     if !(0.0..100.0).contains(&options.reserve_percent) {
-        return Err(AppError("reserve-percent must be between 0 and 100".into()));
+        return Err(Error::Message(
+            "reserve-percent must be between 0 and 100".into(),
+        ));
     }
     let address: std::net::SocketAddr = options
         .listen
         .parse()
-        .map_err(|error| AppError(format!("invalid listen address: {error}")))?;
+        .map_err(|error| Error::Message(format!("invalid listen address: {error}")))?;
     if !address.ip().is_loopback() {
-        return Err(AppError(
+        return Err(Error::Message(
             "refusing non-loopback listen address; the MVP is local-only".into(),
         ));
     }
@@ -141,7 +144,7 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
     {
         Some(token) => token,
         None if options.background => {
-            return Err(AppError(
+            return Err(Error::Message(
                 "background gateway token is missing; run `subhub gateway install` again".into(),
             ));
         }
@@ -150,7 +153,7 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|error| AppError(format!("could not build HTTP client: {error}")))?;
+        .map_err(|error| Error::Message(format!("could not build HTTP client: {error}")))?;
     let mut initial_selected = SelectedAccounts::default();
     for name in options.initial_selected {
         if let Some(credential) = options
@@ -201,7 +204,7 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(address)
         .await
-        .map_err(|error| AppError(format!("could not listen on {address}: {error}")))?;
+        .map_err(|error| Error::Message(format!("could not listen on {address}: {error}")))?;
 
     if !options.background {
         println!("subhub proxy listening on http://{address}");
@@ -214,7 +217,7 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await
-        .map_err(|error| AppError(format!("proxy server failed: {error}")))
+        .map_err(|error| Error::Message(format!("proxy server failed: {error}")))
 }
 
 async fn refresh_due_credentials(state: &ProxyState) {
@@ -343,7 +346,7 @@ async fn audit_all(state: &ProxyState) {
                         .await
                         .map(CredentialUsage::Codex)
                 }
-                None => Err(AppError("Codex credential has no account id".into())),
+                None => Err(Error::audit_fatal("Codex credential has no account id")),
             }
         } else if !credential.scopes.is_empty()
             && !credential
@@ -351,7 +354,7 @@ async fn audit_all(state: &ProxyState) {
                 .iter()
                 .any(|scope| scope == "user:profile")
         {
-            Err(AppError("OAuth token lacks user:profile scope".into()))
+            Err(Error::audit_fatal("OAuth token lacks user:profile scope"))
         } else {
             state
                 .usage_client
@@ -362,7 +365,7 @@ async fn audit_all(state: &ProxyState) {
         if credential.provider == Provider::Claude
             && result
                 .as_ref()
-                .is_err_and(|error| error.to_string().contains("unauthorized"))
+                .is_err_and(|error| error.kind() == ErrorKind::FatalAudit)
             && let Ok(refreshed) = refresh_credential(
                 state,
                 &credential.name,
@@ -395,7 +398,8 @@ async fn record_audit(
         serde_json::json!({
             "credential": credential.name,
             "provider": credential.provider,
-            "error": result.as_ref().err().map(|error| safe_error(error.to_string()))
+            "error": result.as_ref().err().map(|error| safe_error(error.to_string())),
+            "error_kind": result.as_ref().err().map(Error::kind)
         }),
     );
     let mut health = state.health.write().await;
@@ -497,7 +501,7 @@ fn audit_health(
             // rate-limit independently of inference, so a transient audit
             // failure must not make a working credential unroutable.
             usage: previous_usage,
-            error: Some(error.to_string()),
+            error: Some(CredentialError::from(&error)),
             checked_at: now(),
         },
     }
@@ -646,13 +650,13 @@ async fn routing_error_message(state: &ProxyState, provider: Provider) -> String
     if let Some((credential, error)) = relevant.iter().find_map(|credential| {
         health
             .get(&credential.name)
-            .and_then(|entry| entry.error.as_deref())
-            .filter(|error| error.contains("refresh"))
+            .and_then(|entry| entry.error.as_ref())
+            .filter(|error| error.kind == ErrorKind::Refresh)
             .map(|error| (*credential, error))
     }) {
         return format!(
             "credential `{}` could not refresh: {}; run `subhub add {} --force` if its refresh token was revoked",
-            credential.name, error, credential.name
+            credential.name, error.message, credential.name
         );
     }
     if relevant.iter().all(|credential| {
@@ -665,12 +669,13 @@ async fn routing_error_message(state: &ProxyState, provider: Provider) -> String
     let detail = relevant.iter().find_map(|credential| {
         health
             .get(&credential.name)
-            .and_then(|entry| entry.error.as_deref())
+            .and_then(|entry| entry.error.as_ref())
     });
     match detail {
-        Some(error) => {
-            format!("credential usage is unknown because its latest audit failed: {error}")
-        }
+        Some(error) => format!(
+            "credential usage is unknown because its latest audit failed: {}",
+            error.message
+        ),
         None => "credentials are still being audited; retry shortly".into(),
     }
 }
@@ -727,7 +732,10 @@ async fn select_credential(
                     && exclude != Some(credential.name.as_str())
                     && health.get(&credential.name).is_some_and(|entry| {
                         entry.usage.is_none()
-                            && entry.error.as_deref().is_some_and(advisory_audit_error)
+                            && entry
+                                .error
+                                .as_ref()
+                                .is_some_and(|error| error.kind == ErrorKind::TransientAudit)
                     })
             })
             .min_by_key(|credential| health[&credential.name].checked_at)
@@ -737,19 +745,6 @@ async fn select_credential(
         *state.selected.lock().await.slot(provider) = Some(credential.name.clone());
     }
     selected
-}
-
-fn advisory_audit_error(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    ![
-        "unauthorized",
-        "forbidden",
-        "lacks user",
-        "refresh",
-        "no account id",
-    ]
-    .iter()
-    .any(|blocked| error.contains(blocked))
 }
 
 fn utilization(health: &HashMap<String, CredentialHealth>, name: &str, model: Option<&str>) -> f64 {
@@ -810,7 +805,7 @@ async fn forward(
     request
         .send()
         .await
-        .map_err(|error| AppError(format!("upstream request failed: {error}")))
+        .map_err(|error| Error::Message(format!("upstream request failed: {error}")))
 }
 
 fn oauth_beta_header(headers: &HeaderMap) -> String {
@@ -834,7 +829,14 @@ fn oauth_beta_header(headers: &HeaderMap) -> String {
 
 async fn mark_failed(state: &ProxyState, name: &str, status: StatusCode) {
     if let Some(health) = state.health.write().await.get_mut(name) {
-        health.error = Some(format!("inference request returned {status}"));
+        health.error = Some(CredentialError {
+            kind: if status == StatusCode::UNAUTHORIZED {
+                ErrorKind::FatalAudit
+            } else {
+                ErrorKind::TransientAudit
+            },
+            message: format!("inference request returned {status}"),
+        });
         if status == StatusCode::UNAUTHORIZED {
             health.usage = None;
         } else if let Some(usage) = health.usage.as_mut() {
@@ -973,8 +975,10 @@ mod tests {
         let state = test_state();
         let mut health = state.health.write().await;
         health.get_mut("ready").unwrap().usage = None;
-        health.get_mut("ready").unwrap().error =
-            Some("Claude OAuth refresh returned 400 Bad Request".into());
+        health.get_mut("ready").unwrap().error = Some(CredentialError {
+            kind: ErrorKind::Refresh,
+            message: "Claude OAuth refresh returned 400 Bad Request".into(),
+        });
         drop(health);
 
         let message = routing_error_message(&state, Provider::Claude).await;
@@ -988,9 +992,15 @@ mod tests {
         let state = test_state();
         let mut health = state.health.write().await;
         health.get_mut("full").unwrap().usage = None;
-        health.get_mut("full").unwrap().error = Some("usage request timed out".into());
+        health.get_mut("full").unwrap().error = Some(CredentialError {
+            kind: ErrorKind::TransientAudit,
+            message: "usage request timed out".into(),
+        });
         health.get_mut("ready").unwrap().usage = None;
-        health.get_mut("ready").unwrap().error = Some("OAuth token is unauthorized".into());
+        health.get_mut("ready").unwrap().error = Some(CredentialError {
+            kind: ErrorKind::FatalAudit,
+            message: "OAuth token is unauthorized".into(),
+        });
         drop(health);
 
         let selected = select_credential(&state, None, None, Provider::Claude)
@@ -1151,8 +1161,8 @@ mod tests {
 
         let health = audit_health(
             Some(previous),
-            Err(AppError(
-                "usage endpoint rate limited; retry after 300".into(),
+            Err(Error::audit_transient(
+                "usage endpoint rate limited; retry after 300",
             )),
         );
 
@@ -1167,17 +1177,21 @@ mod tests {
                 .and_then(|window| window.utilization),
             Some(25.0)
         );
+        let error = health.error.unwrap();
+        assert_eq!(error.kind, ErrorKind::TransientAudit);
         assert_eq!(
-            health.error.as_deref(),
-            Some("usage endpoint rate limited; retry after 300")
+            error.message,
+            "usage endpoint rate limited; retry after 300"
         );
     }
 
     #[test]
     fn initial_failed_audit_remains_unroutable() {
-        let health = audit_health(None, Err(AppError("usage request failed".into())));
+        let health = audit_health(None, Err(Error::Message("usage request failed".into())));
 
         assert!(health.usage.is_none());
-        assert_eq!(health.error.as_deref(), Some("usage request failed"));
+        let error = health.error.unwrap();
+        assert_eq!(error.kind, ErrorKind::FatalAudit);
+        assert_eq!(error.message, "usage request failed");
     }
 }

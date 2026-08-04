@@ -1160,6 +1160,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "toml_edit",
 ]

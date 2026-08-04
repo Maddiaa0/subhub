@@ -5,8 +5,6 @@ use serde_json::Value;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
 use std::env;
-use std::error::Error;
-use std::fmt;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -14,10 +12,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
 mod codex;
+mod error;
 mod lifecycle;
 mod observability;
 mod proxy;
 pub mod usage;
+
+pub use error::{Error, Result};
 
 const ACTIVE_SERVICE: &str = "Claude Code-credentials";
 const VAULT_SERVICE: &str = "subhub-credentials";
@@ -30,31 +31,6 @@ const REQUESTED_OAUTH_SCOPES: [&str; 4] = [
     "user:mcp_servers",
 ];
 const REQUIRED_OAUTH_SCOPES: [&str; 2] = ["user:inference", "user:profile"];
-
-pub type Result<T> = std::result::Result<T, AppError>;
-
-#[derive(Debug)]
-pub struct AppError(String);
-
-impl fmt::Display for AppError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Error for AppError {}
-
-impl From<io::Error> for AppError {
-    fn from(value: io::Error) -> Self {
-        Self(value.to_string())
-    }
-}
-
-impl From<serde_json::Error> for AppError {
-    fn from(value: serde_json::Error) -> Self {
-        Self(value.to_string())
-    }
-}
 
 #[derive(Parser)]
 #[command(
@@ -276,7 +252,9 @@ impl Index {
 
 pub fn run() -> Result<()> {
     if !cfg!(any(target_os = "macos", target_os = "linux")) {
-        return Err(AppError("subhub currently requires macOS or Linux".into()));
+        return Err(Error::Message(
+            "subhub currently requires macOS or Linux".into(),
+        ));
     }
 
     dispatch(Cli::parse())
@@ -341,13 +319,13 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
 
 fn runtime() -> Result<tokio::runtime::Runtime> {
     tokio::runtime::Runtime::new()
-        .map_err(|error| AppError(format!("could not start async runtime: {error}")))
+        .map_err(|error| Error::Message(format!("could not start async runtime: {error}")))
 }
 
 fn add(path: &Path, index: &mut Index, name: &str, force: bool, device_auth: bool) -> Result<()> {
     validate_name(name)?;
     if index.contains(name) && !force {
-        return Err(AppError(format!(
+        return Err(Error::Message(format!(
             "credential \"{name}\" already exists; use --force to replace it"
         )));
     }
@@ -359,7 +337,7 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool, device_auth: boo
         return add_codex(path, index, name, device_auth);
     }
     if device_auth {
-        return Err(AppError(
+        return Err(Error::Message(
             "--device-auth only applies to Codex logins; choose subscription type 2".into(),
         ));
     }
@@ -372,13 +350,13 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool, device_auth: boo
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .map_err(|error| AppError(format!("could not run `claude auth login`: {error}")))?;
+        .map_err(|error| Error::Message(format!("could not run `claude auth login`: {error}")))?;
 
     require_success(status, "`claude auth login` failed")?;
 
     let account = current_user()?;
     let credential = credential_read(ACTIVE_SERVICE, &account).map_err(|error| {
-        AppError(format!(
+        Error::Message(format!(
             "login completed, but the Claude Code credential could not be read: {error}"
         ))
     })?;
@@ -433,11 +411,12 @@ fn add_codex(path: &Path, index: &mut Index, name: &str, device_auth: bool) -> R
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .map_err(|error| AppError(format!("could not run `codex login`: {error}")))?;
+        .map_err(|error| Error::Message(format!("could not run `codex login`: {error}")))?;
     let capture = (|| {
         require_success(status, "`codex login` failed")?;
-        let raw = fs::read_to_string(&auth_path)
-            .map_err(|error| AppError(format!("Codex login cache was not readable: {error}")))?;
+        let raw = fs::read_to_string(&auth_path).map_err(|error| {
+            Error::Message(format!("Codex login cache was not readable: {error}"))
+        })?;
         let credential: Value = serde_json::from_str(&raw)?;
         for key in ["access_token", "refresh_token", "account_id"] {
             if credential
@@ -445,7 +424,7 @@ fn add_codex(path: &Path, index: &mut Index, name: &str, device_auth: bool) -> R
                 .and_then(Value::as_str)
                 .is_none()
             {
-                return Err(AppError(format!(
+                return Err(Error::Message(format!(
                     "Codex login did not provide tokens.{key}"
                 )));
             }
@@ -506,25 +485,25 @@ fn set(
 ) -> Result<()> {
     validate_name(name)?;
     if !index.contains(name) {
-        return Err(AppError(format!(
+        return Err(Error::Message(format!(
             "credential \"{name}\" is not in the index; run `subhub list`"
         )));
     }
 
     let stored = vault_read(name).map_err(|error| {
-        AppError(format!(
+        Error::Message(format!(
             "credential \"{name}\" is indexed but missing from secure storage: {error}"
         ))
     })?;
     let entry: VaultEntry = serde_json::from_str(&stored).map_err(|error| {
-        AppError(format!(
+        Error::Message(format!(
             "{error}; refresh it with `subhub add {name} --force`"
         ))
     })?;
     if let Some(expected) = expected_provider
         && expected != entry.provider
     {
-        return Err(AppError(format!(
+        return Err(Error::Message(format!(
             "credential \"{name}\" belongs to {}, not {}",
             provider_name(entry.provider),
             provider_name(expected)
@@ -558,9 +537,9 @@ pub(crate) fn provider_name(provider: Provider) -> &'static str {
 #[cfg(test)]
 fn decode_vault_entry(stored: &str) -> Result<(String, Value)> {
     let parsed: Value = serde_json::from_str(stored)
-        .map_err(|_| AppError("saved Keychain entry is not valid JSON".into()))?;
+        .map_err(|_| Error::Message("saved Keychain entry is not valid JSON".into()))?;
     let entry: VaultEntry = serde_json::from_value(parsed)
-        .map_err(|_| AppError("saved credential predates account metadata support".into()))?;
+        .map_err(|_| Error::Message("saved credential predates account metadata support".into()))?;
     Ok((
         serde_json::to_string(&entry.credential)?,
         entry.oauth_account,
@@ -578,12 +557,12 @@ fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
     let mut credentials = Vec::with_capacity(index.credentials.len());
     for name in &index.credentials {
         let stored = vault_read(name).map_err(|error| {
-            AppError(format!(
+            Error::Message(format!(
                 "credential \"{name}\" is missing from secure storage: {error}"
             ))
         })?;
         let parsed: Value = serde_json::from_str(&stored)
-            .map_err(|_| AppError(format!("credential \"{name}\" is not valid JSON")))?;
+            .map_err(|_| Error::Message(format!("credential \"{name}\" is not valid JSON")))?;
         let provider: Provider = parsed
             .get("provider")
             .cloned()
@@ -592,7 +571,7 @@ fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
             .unwrap_or_default();
         let credential = parsed
             .get("credential")
-            .ok_or_else(|| AppError(format!("credential \"{name}\" has no credential")))?;
+            .ok_or_else(|| Error::Message(format!("credential \"{name}\" has no credential")))?;
         let oauth = credential.get("claudeAiOauth").and_then(Value::as_object);
         let access_token = match provider {
             Provider::Claude => oauth.and_then(|value| value.get("accessToken")),
@@ -600,7 +579,7 @@ fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
         }
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError(format!("credential \"{name}\" has no access token")))?;
+        .ok_or_else(|| Error::Message(format!("credential \"{name}\" has no access token")))?;
         let scopes = oauth
             .and_then(|value| value.get("scopes"))
             .and_then(Value::as_array)
@@ -646,7 +625,7 @@ pub(crate) async fn refresh_claude_credential(
     let stored = vault_read(name)?;
     let mut entry: VaultEntry = serde_json::from_str(&stored)?;
     if entry.provider != Provider::Claude {
-        return Err(AppError(format!(
+        return Err(Error::Message(format!(
             "credential \"{name}\" is not a Claude credential"
         )));
     }
@@ -654,12 +633,12 @@ pub(crate) async fn refresh_claude_credential(
         .credential
         .get_mut("claudeAiOauth")
         .and_then(Value::as_object_mut)
-        .ok_or_else(|| AppError(format!("credential \"{name}\" has no Claude OAuth data")))?;
+        .ok_or_else(|| Error::Refresh(format!("credential \"{name}\" has no Claude OAuth data")))?;
     let refresh_token = oauth
         .get("refreshToken")
         .and_then(Value::as_str)
         .filter(|token| !token.is_empty())
-        .ok_or_else(|| AppError(format!("credential \"{name}\" has no refresh token")))?
+        .ok_or_else(|| Error::Refresh(format!("credential \"{name}\" has no refresh token")))?
         .to_owned();
     let refreshed = request_claude_refresh(client, CLAUDE_TOKEN_URL, &refresh_token).await?;
     oauth.insert("accessToken".into(), Value::String(refreshed.access_token));
@@ -682,7 +661,7 @@ pub(crate) async fn refresh_claude_credential(
     gateway_credentials()?
         .into_iter()
         .find(|credential| credential.name == name)
-        .ok_or_else(|| AppError(format!("refreshed credential \"{name}\" disappeared")))
+        .ok_or_else(|| Error::Message(format!("refreshed credential \"{name}\" disappeared")))
 }
 
 async fn request_claude_refresh(
@@ -707,21 +686,20 @@ async fn request_claude_refresh(
         }))
         .send()
         .await
-        .map_err(|error| AppError(format!("Claude OAuth refresh request failed: {error}")))?;
+        .map_err(|error| Error::Refresh(format!("Claude OAuth refresh request failed: {error}")))?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(AppError(format!(
+        return Err(Error::Refresh(format!(
             "Claude OAuth refresh returned {status}: {}",
             body.chars().take(300).collect::<String>()
         )));
     }
-    let refreshed: ClaudeRefreshResponse = response
-        .json()
-        .await
-        .map_err(|error| AppError(format!("invalid Claude OAuth refresh response: {error}")))?;
+    let refreshed: ClaudeRefreshResponse = response.json().await.map_err(|error| {
+        Error::Refresh(format!("invalid Claude OAuth refresh response: {error}"))
+    })?;
     if refreshed.access_token.is_empty() || refreshed.expires_in <= 0 {
-        return Err(AppError(
+        return Err(Error::Refresh(
             "Claude OAuth refresh returned invalid token data".into(),
         ));
     }
@@ -746,7 +724,7 @@ enum AuditUsage {
 
 async fn audit(credentials: Vec<StoredCredential>, json: bool) -> Result<()> {
     if credentials.is_empty() {
-        return Err(AppError(
+        return Err(Error::Message(
             "no credentials saved; run `subhub add <name>`".into(),
         ));
     }
@@ -907,17 +885,17 @@ fn claude_config_path() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".claude.json"))
-        .ok_or_else(|| AppError("HOME is not set".into()))
+        .ok_or_else(|| Error::Message("HOME is not set".into()))
 }
 
 fn read_oauth_account() -> Result<Value> {
     let path = claude_config_path()?;
     let contents = fs::read_to_string(&path)
-        .map_err(|error| AppError(format!("could not read {}: {error}", path.display())))?;
+        .map_err(|error| Error::Message(format!("could not read {}: {error}", path.display())))?;
     let config: Value = serde_json::from_str(&contents)
-        .map_err(|error| AppError(format!("invalid {}: {error}", path.display())))?;
+        .map_err(|error| Error::Message(format!("invalid {}: {error}", path.display())))?;
     config.get("oauthAccount").cloned().ok_or_else(|| {
-        AppError(format!(
+        Error::Message(format!(
             "Claude login did not write oauthAccount metadata to {}",
             path.display()
         ))
@@ -927,22 +905,22 @@ fn read_oauth_account() -> Result<Value> {
 fn write_oauth_account(oauth_account: &Value) -> Result<()> {
     let path = claude_config_path()?;
     let contents = fs::read_to_string(&path)
-        .map_err(|error| AppError(format!("could not read {}: {error}", path.display())))?;
+        .map_err(|error| Error::Message(format!("could not read {}: {error}", path.display())))?;
     let mut config: Value = serde_json::from_str(&contents)
-        .map_err(|error| AppError(format!("invalid {}: {error}", path.display())))?;
+        .map_err(|error| Error::Message(format!("invalid {}: {error}", path.display())))?;
     let object = config
         .as_object_mut()
-        .ok_or_else(|| AppError(format!("{} is not a JSON object", path.display())))?;
+        .ok_or_else(|| Error::Message(format!("{} is not a JSON object", path.display())))?;
     object.insert("oauthAccount".into(), oauth_account.clone());
     save_json_file(&path, &config)
 }
 
 fn validate_name(name: &str) -> Result<()> {
     if name.trim().is_empty() {
-        return Err(AppError("credential name cannot be empty".into()));
+        return Err(Error::Message("credential name cannot be empty".into()));
     }
     if name.chars().any(char::is_control) {
-        return Err(AppError(
+        return Err(Error::Message(
             "credential name cannot contain control characters".into(),
         ));
     }
@@ -950,15 +928,15 @@ fn validate_name(name: &str) -> Result<()> {
 }
 
 fn validate_credential(raw: &str) -> Result<()> {
-    let parsed: Value =
-        serde_json::from_str(raw).map_err(|_| AppError("credential is not valid JSON".into()))?;
+    let parsed: Value = serde_json::from_str(raw)
+        .map_err(|_| Error::Message("credential is not valid JSON".into()))?;
     let oauth = parsed
         .get("claudeAiOauth")
         .and_then(Value::as_object)
-        .ok_or_else(|| AppError("credential has no claudeAiOauth object".into()))?;
+        .ok_or_else(|| Error::Message("credential has no claudeAiOauth object".into()))?;
     for key in ["accessToken", "refreshToken"] {
         if oauth.get(key).and_then(Value::as_str).is_none() {
-            return Err(AppError(format!(
+            return Err(Error::Message(format!(
                 "credential has no valid claudeAiOauth.{key}"
             )));
         }
@@ -982,14 +960,14 @@ fn requested_oauth_scopes(existing: Option<&std::ffi::OsStr>) -> String {
 }
 
 fn validate_required_scopes(raw: &str) -> Result<()> {
-    let parsed: Value =
-        serde_json::from_str(raw).map_err(|_| AppError("credential is not valid JSON".into()))?;
+    let parsed: Value = serde_json::from_str(raw)
+        .map_err(|_| Error::Message("credential is not valid JSON".into()))?;
     let scopes = parsed
         .get("claudeAiOauth")
         .and_then(|oauth| oauth.get("scopes"))
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            AppError(
+            Error::Message(
                 "Claude login returned no OAuth scopes; update Claude Code and log in again".into(),
             )
         })?;
@@ -1006,7 +984,7 @@ fn validate_required_scopes(raw: &str) -> Result<()> {
     if missing.is_empty() {
         Ok(())
     } else {
-        Err(AppError(format!(
+        Err(Error::Message(format!(
             "Claude login did not grant required OAuth scope(s): {}; \
              update Claude Code and retry `subhub add`",
             missing.join(", ")
@@ -1019,10 +997,10 @@ fn credential_read(service: &str, account: &str) -> Result<String> {
     let output = Command::new("security")
         .args(["find-generic-password", "-s", service, "-a", account, "-w"])
         .output()
-        .map_err(|error| AppError(format!("could not run `security`: {error}")))?;
+        .map_err(|error| Error::Message(format!("could not run `security`: {error}")))?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(AppError(if detail.is_empty() {
+        return Err(Error::Message(if detail.is_empty() {
             "Keychain item was not found".into()
         } else {
             detail
@@ -1030,7 +1008,7 @@ fn credential_read(service: &str, account: &str) -> Result<String> {
     }
     String::from_utf8(output.stdout)
         .map(|value| value.trim_end_matches(['\r', '\n']).to_owned())
-        .map_err(|_| AppError("Keychain returned a non-UTF-8 credential".into()))
+        .map_err(|_| Error::Message("Keychain returned a non-UTF-8 credential".into()))
 }
 
 #[cfg(target_os = "macos")]
@@ -1047,12 +1025,14 @@ fn credential_write(service: &str, account: &str, credential: &str) -> Result<()
             "-U",
         ])
         .output()
-        .map_err(|error| AppError(format!("could not run `security`: {error}")))?;
+        .map_err(|error| Error::Message(format!("could not run `security`: {error}")))?;
     if output.status.success() {
         return Ok(());
     }
     let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    Err(AppError(format!("could not update Keychain: {detail}")))
+    Err(Error::Message(format!(
+        "could not update Keychain: {detail}"
+    )))
 }
 
 #[cfg(target_os = "macos")]
@@ -1060,12 +1040,12 @@ fn credential_delete(service: &str, account: &str) -> Result<()> {
     let output = Command::new("security")
         .args(["delete-generic-password", "-s", service, "-a", account])
         .output()
-        .map_err(|error| AppError(format!("could not run `security`: {error}")))?;
+        .map_err(|error| Error::Message(format!("could not run `security`: {error}")))?;
     if output.status.success() {
         return Ok(());
     }
     let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    Err(AppError(if detail.is_empty() {
+    Err(Error::Message(if detail.is_empty() {
         "Keychain item was not found".into()
     } else {
         detail
@@ -1076,7 +1056,7 @@ fn credential_delete(service: &str, account: &str) -> Result<()> {
 fn credential_read(service: &str, account: &str) -> Result<String> {
     if service == ACTIVE_SERVICE {
         return fs::read_to_string(claude_credentials_path()?).map_err(|error| {
-            AppError(format!(
+            Error::Message(format!(
                 "Claude Code credential file was not readable: {error}"
             ))
         });
@@ -1087,7 +1067,7 @@ fn credential_read(service: &str, account: &str) -> Result<String> {
         .get(service)
         .and_then(|accounts| accounts.get(account))
         .cloned()
-        .ok_or_else(|| AppError("credential was not found".into()))
+        .ok_or_else(|| Error::Message("credential was not found".into()))
 }
 
 #[cfg(target_os = "linux")]
@@ -1112,7 +1092,7 @@ fn credential_delete(service: &str, account: &str) -> Result<()> {
         .get_mut(service)
         .and_then(|accounts| accounts.remove(account));
     if removed.is_none() {
-        return Err(AppError("credential was not found".into()));
+        return Err(Error::Message("credential was not found".into()));
     }
     if store.get(service).is_some_and(BTreeMap::is_empty) {
         store.remove(service);
@@ -1129,9 +1109,9 @@ fn read_credential_store(path: &Path) -> Result<CredentialStore> {
         return Ok(BTreeMap::new());
     }
     let raw = fs::read_to_string(path)
-        .map_err(|error| AppError(format!("could not read {}: {error}", path.display())))?;
+        .map_err(|error| Error::Message(format!("could not read {}: {error}", path.display())))?;
     serde_json::from_str(&raw).map_err(|error| {
-        AppError(format!(
+        Error::Message(format!(
             "invalid credential store {}: {error}",
             path.display()
         ))
@@ -1148,7 +1128,7 @@ fn write_credential_store(path: &Path, store: &CredentialStore) -> Result<()> {
 fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| AppError("credential path has no parent directory".into()))?;
+        .ok_or_else(|| Error::Message("credential path has no parent directory".into()))?;
     fs::create_dir_all(parent)?;
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     let temporary = path.with_extension("json.tmp");
@@ -1173,7 +1153,7 @@ fn claude_credentials_path() -> Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
         .map(|directory| directory.join(".credentials.json"))
-        .ok_or_else(|| AppError("CLAUDE_CONFIG_DIR and HOME are not set".into()))
+        .ok_or_else(|| Error::Message("CLAUDE_CONFIG_DIR and HOME are not set".into()))
 }
 
 fn vault_read(name: &str) -> Result<String> {
@@ -1193,7 +1173,7 @@ fn require_success(status: ExitStatus, message: &str) -> Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(AppError(format!("{message} (status {status})")))
+        Err(Error::Message(format!("{message} (status {status})")))
     }
 }
 
@@ -1201,7 +1181,7 @@ fn current_user() -> Result<String> {
     env::var("USER")
         .ok()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError("USER is not set".into()))
+        .ok_or_else(|| Error::Message("USER is not set".into()))
 }
 
 fn config_base_path() -> Result<PathBuf> {
@@ -1210,7 +1190,7 @@ fn config_base_path() -> Result<PathBuf> {
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
     #[cfg(target_os = "macos")]
     let path = env::var_os("XDG_CONFIG").map(PathBuf::from).or(path);
-    path.ok_or_else(|| AppError("XDG_CONFIG_HOME and HOME are not set".into()))
+    path.ok_or_else(|| Error::Message("XDG_CONFIG_HOME and HOME are not set".into()))
 }
 
 fn index_path() -> Result<PathBuf> {
@@ -1239,11 +1219,11 @@ fn load_index(path: &Path) -> Result<Index> {
         return Ok(Index::new());
     }
     let contents = fs::read_to_string(path)
-        .map_err(|error| AppError(format!("could not read {}: {error}", path.display())))?;
+        .map_err(|error| Error::Message(format!("could not read {}: {error}", path.display())))?;
     let index: Index = serde_json::from_str(&contents)
-        .map_err(|error| AppError(format!("invalid index {}: {error}", path.display())))?;
+        .map_err(|error| Error::Message(format!("invalid index {}: {error}", path.display())))?;
     if index.version != 1 {
-        return Err(AppError(format!(
+        return Err(Error::Message(format!(
             "unsupported index version {} in {}",
             index.version,
             path.display()
@@ -1255,7 +1235,7 @@ fn load_index(path: &Path) -> Result<Index> {
 fn save_index(path: &Path, index: &Index) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| AppError("index path has no parent directory".into()))?;
+        .ok_or_else(|| Error::Message("index path has no parent directory".into()))?;
     fs::create_dir_all(parent)?;
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
 
@@ -1265,7 +1245,7 @@ fn save_index(path: &Path, index: &Index) -> Result<()> {
 fn save_json_file(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| AppError("JSON path has no parent directory".into()))?;
+        .ok_or_else(|| Error::Message("JSON path has no parent directory".into()))?;
     fs::create_dir_all(parent)?;
     let temporary = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(value)?;

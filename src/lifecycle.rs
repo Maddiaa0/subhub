@@ -1,6 +1,6 @@
 use crate::{
-    AppError, Result, VAULT_SERVICE, credential_delete, credential_read, credential_write,
-    index_path, load_index, save_json_file,
+    Error, Result, VAULT_SERVICE, credential_delete, credential_read, credential_write, index_path,
+    load_index, save_json_file,
 };
 use rand::distr::{Alphanumeric, SampleString};
 use serde::{Deserialize, Serialize};
@@ -64,7 +64,7 @@ pub(crate) fn select_gateway_account(name: &str) -> Result<bool> {
         } else {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            Err(AppError(format!(
+            Err(Error::Message(format!(
                 "gateway returned {status}: {}",
                 body.chars().take(200).collect::<String>()
             )))
@@ -95,7 +95,7 @@ pub(crate) fn reload_gateway_accounts() -> Result<bool> {
         } else {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            Err(AppError(format!(
+            Err(Error::Message(format!(
                 "gateway returned {status}: {}",
                 body.chars().take(200).collect::<String>()
             )))
@@ -115,8 +115,9 @@ fn ensure_gateway_token() -> Result<String> {
 }
 
 pub(crate) fn install() -> Result<()> {
-    let binary_path = env::current_exe()
-        .map_err(|error| AppError(format!("could not resolve the Subhub executable: {error}")))?;
+    let binary_path = env::current_exe().map_err(|error| {
+        Error::Message(format!("could not resolve the Subhub executable: {error}"))
+    })?;
     let settings_path = claude_settings_path()?;
     let state_path = install_state_path()?;
     let mut settings = read_json_object(&settings_path)?;
@@ -190,7 +191,7 @@ pub(crate) fn uninstall(purge: bool) -> Result<()> {
         restore_claude_settings(&state)?;
         restore_codex_config(&state)?;
         fs::remove_file(&state_path).map_err(|error| {
-            AppError(format!(
+            Error::Message(format!(
                 "could not remove {}: {error}",
                 state_path.display()
             ))
@@ -199,7 +200,7 @@ pub(crate) fn uninstall(purge: bool) -> Result<()> {
     let agent_path = background_service_path()?;
     if agent_path.exists() {
         fs::remove_file(&agent_path).map_err(|error| {
-            AppError(format!(
+            Error::Message(format!(
                 "could not remove {}: {error}",
                 agent_path.display()
             ))
@@ -209,7 +210,7 @@ pub(crate) fn uninstall(purge: bool) -> Result<()> {
     let helper_path = auth_helper_path()?;
     if helper_path.exists() {
         fs::remove_file(&helper_path).map_err(|error| {
-            AppError(format!(
+            Error::Message(format!(
                 "could not remove {}: {error}",
                 helper_path.display()
             ))
@@ -218,7 +219,7 @@ pub(crate) fn uninstall(purge: bool) -> Result<()> {
     let statusline_path = statusline_helper_path()?;
     if statusline_path.exists() {
         fs::remove_file(&statusline_path).map_err(|error| {
-            AppError(format!(
+            Error::Message(format!(
                 "could not remove {}: {error}",
                 statusline_path.display()
             ))
@@ -242,7 +243,7 @@ pub(crate) fn reinstall() -> Result<()> {
 pub(crate) fn start() -> Result<()> {
     let agent_path = background_service_path()?;
     if !agent_path.exists() {
-        return Err(AppError(
+        return Err(Error::Message(
             "Subhub is not installed; run `subhub gateway install`".into(),
         ));
     }
@@ -366,8 +367,13 @@ fn print_gateway_health(status: &Value, provider_filter: Option<crate::Provider>
             "  {name} [{provider}]{}: token {token}, audit {audit}",
             if active { " (selected)" } else { "" }
         );
-        if let Some(error) = health.get("error").and_then(Value::as_str) {
-            println!("    Last error: {error}");
+        if let Some(error) = health.get("error").and_then(Value::as_object) {
+            let kind = error
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+            println!("    Last error [{kind}]: {message}");
         }
     }
 }
@@ -376,7 +382,7 @@ pub(crate) fn statusline() -> Result<()> {
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
-        .map_err(|error| AppError(format!("could not read status-line input: {error}")))?;
+        .map_err(|error| Error::Message(format!("could not read status-line input: {error}")))?;
     let previous = previous_statusline_output(&input).unwrap_or_default();
     let subhub = fetch_gateway_status()
         .map(|status| format_statusline_segment(&status))
@@ -403,14 +409,14 @@ fn fetch_gateway_status() -> Result<Value> {
             .timeout(std::time::Duration::from_secs(2))
             .send()
             .await
-            .map_err(|error| AppError(error.to_string()))?;
+            .map_err(|error| Error::Message(error.to_string()))?;
         if !response.status().is_success() {
-            return Err(AppError(format!("HTTP {}", response.status())));
+            return Err(Error::Message(format!("HTTP {}", response.status())));
         }
         response
             .json()
             .await
-            .map_err(|error| AppError(error.to_string()))
+            .map_err(|error| Error::Message(error.to_string()))
     })
 }
 
@@ -476,18 +482,18 @@ fn previous_statusline_output(input: &str) -> Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| AppError(format!("could not run previous status line: {error}")))?;
+        .map_err(|error| Error::Message(format!("could not run previous status line: {error}")))?;
     child
         .stdin
         .take()
-        .ok_or_else(|| AppError("previous status line has no stdin".into()))?
+        .ok_or_else(|| Error::Message("previous status line has no stdin".into()))?
         .write_all(input.as_bytes())?;
     let output = child
         .wait_with_output()
-        .map_err(|error| AppError(format!("previous status line failed: {error}")))?;
+        .map_err(|error| Error::Message(format!("previous status line failed: {error}")))?;
     if output.status.success() {
         String::from_utf8(output.stdout)
-            .map_err(|_| AppError("previous status line returned non-UTF-8 output".into()))
+            .map_err(|_| Error::Message("previous status line returned non-UTF-8 output".into()))
     } else {
         Ok(String::new())
     }
@@ -505,7 +511,7 @@ fn purge_data() -> Result<()> {
             let _ = credential_delete(VAULT_SERVICE, &name);
         }
         fs::remove_file(&index_path).map_err(|error| {
-            AppError(format!(
+            Error::Message(format!(
                 "could not remove {}: {error}",
                 index_path.display()
             ))
@@ -571,7 +577,7 @@ fn claude_settings_path() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".claude").join("settings.json"))
-        .ok_or_else(|| AppError("HOME is not set".into()))
+        .ok_or_else(|| Error::Message("HOME is not set".into()))
 }
 
 fn codex_config_path() -> Result<PathBuf> {
@@ -579,14 +585,14 @@ fn codex_config_path() -> Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
         .map(|home| home.join("config.toml"))
-        .ok_or_else(|| AppError("CODEX_HOME and HOME are not set".into()))
+        .ok_or_else(|| Error::Message("CODEX_HOME and HOME are not set".into()))
 }
 
 fn read_codex_config() -> Result<String> {
     let path = codex_config_path()?;
     if path.exists() {
         fs::read_to_string(&path)
-            .map_err(|error| AppError(format!("could not read {}: {error}", path.display())))
+            .map_err(|error| Error::Message(format!("could not read {}: {error}", path.display())))
     } else {
         Ok(String::new())
     }
@@ -596,7 +602,7 @@ fn install_codex_config() -> Result<()> {
     let path = codex_config_path()?;
     let mut document = read_codex_config()?
         .parse::<DocumentMut>()
-        .map_err(|error| AppError(format!("invalid {}: {error}", path.display())))?;
+        .map_err(|error| Error::Message(format!("invalid {}: {error}", path.display())))?;
     document["model_provider"] = value("subhub");
     let mut provider = Table::new();
     provider["name"] = value("Subhub");
@@ -617,10 +623,10 @@ fn restore_codex_config(state: &InstallState) -> Result<()> {
     let path = codex_config_path()?;
     let mut current = read_codex_config()?
         .parse::<DocumentMut>()
-        .map_err(|error| AppError(format!("invalid {}: {error}", path.display())))?;
+        .map_err(|error| Error::Message(format!("invalid {}: {error}", path.display())))?;
     let prior = previous
         .parse::<DocumentMut>()
-        .map_err(|error| AppError(format!("saved Codex config is invalid: {error}")))?;
+        .map_err(|error| Error::Message(format!("saved Codex config is invalid: {error}")))?;
     if current["model_provider"].as_str() == Some("subhub") {
         current["model_provider"] = prior.get("model_provider").cloned().unwrap_or(Item::None);
     }
@@ -657,7 +663,7 @@ fn background_service_path() -> Result<PathBuf> {
                 .join("LaunchAgents")
                 .join(format!("{LAUNCH_AGENT_LABEL}.plist"))
         })
-        .ok_or_else(|| AppError("HOME is not set".into()))
+        .ok_or_else(|| Error::Message("HOME is not set".into()))
 }
 
 #[cfg(target_os = "linux")]
@@ -666,7 +672,7 @@ fn background_service_path() -> Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .map(|config| config.join("systemd").join("user").join(SYSTEMD_UNIT_NAME))
-        .ok_or_else(|| AppError("XDG_CONFIG_HOME and HOME are not set".into()))
+        .ok_or_else(|| Error::Message("XDG_CONFIG_HOME and HOME are not set".into()))
 }
 
 #[cfg(target_os = "macos")]
@@ -674,7 +680,7 @@ fn write_background_service(path: &Path, binary: &Path) -> Result<()> {
     let binary = xml_escape(
         binary
             .to_str()
-            .ok_or_else(|| AppError("Subhub executable path is not UTF-8".into()))?,
+            .ok_or_else(|| Error::Message("Subhub executable path is not UTF-8".into()))?,
     );
     let contents = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -704,10 +710,10 @@ fn write_background_service(path: &Path, binary: &Path) -> Result<()> {
     );
     let parent = path
         .parent()
-        .ok_or_else(|| AppError("LaunchAgent path has no parent".into()))?;
+        .ok_or_else(|| Error::Message("LaunchAgent path has no parent".into()))?;
     fs::create_dir_all(parent)?;
     fs::write(path, contents)
-        .map_err(|error| AppError(format!("could not write {}: {error}", path.display())))
+        .map_err(|error| Error::Message(format!("could not write {}: {error}", path.display())))
 }
 
 #[cfg(target_os = "linux")]
@@ -722,7 +728,7 @@ fn write_background_service(path: &Path, binary: &Path) -> Result<()> {
 fn write_auth_helper(path: &Path, binary: &Path) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| AppError("auth helper path has no parent".into()))?;
+        .ok_or_else(|| Error::Message("auth helper path has no parent".into()))?;
     fs::create_dir_all(parent)?;
     let contents = format!(
         "#!/bin/sh\nexec {} gateway auth-token\n",
@@ -750,7 +756,7 @@ fn write_statusline_helper(path: &Path, binary: &Path) -> Result<()> {
 fn write_executable_helper(path: &Path, contents: &str) -> Result<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| AppError("helper path has no parent".into()))?;
+        .ok_or_else(|| Error::Message("helper path has no parent".into()))?;
     fs::create_dir_all(parent)?;
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true).mode(0o700);
@@ -789,7 +795,7 @@ fn ensure_no_conflicting_claude_credentials(settings: &Value) -> Result<()> {
     if conflicts.is_empty() {
         Ok(())
     } else {
-        Err(AppError(format!(
+        Err(Error::Message(format!(
             "Claude settings define {}; remove {} before installing Subhub because they override apiKeyHelper",
             conflicts.join(" and "),
             if conflicts.len() == 1 { "it" } else { "them" }
@@ -799,11 +805,11 @@ fn ensure_no_conflicting_claude_credentials(settings: &Value) -> Result<()> {
 
 fn read_install_state(path: &Path) -> Result<InstallState> {
     let contents = fs::read_to_string(path)
-        .map_err(|error| AppError(format!("could not read {}: {error}", path.display())))?;
+        .map_err(|error| Error::Message(format!("could not read {}: {error}", path.display())))?;
     let state: InstallState = serde_json::from_str(&contents)
-        .map_err(|error| AppError(format!("invalid {}: {error}", path.display())))?;
+        .map_err(|error| Error::Message(format!("invalid {}: {error}", path.display())))?;
     if state.version != 1 {
-        return Err(AppError(format!(
+        return Err(Error::Message(format!(
             "unsupported install state version {}",
             state.version
         )));
@@ -816,13 +822,16 @@ fn read_json_object(path: &Path) -> Result<Value> {
         return Ok(Value::Object(Map::new()));
     }
     let contents = fs::read_to_string(path)
-        .map_err(|error| AppError(format!("could not read {}: {error}", path.display())))?;
+        .map_err(|error| Error::Message(format!("could not read {}: {error}", path.display())))?;
     let value: Value = serde_json::from_str(&contents)
-        .map_err(|error| AppError(format!("invalid {}: {error}", path.display())))?;
+        .map_err(|error| Error::Message(format!("invalid {}: {error}", path.display())))?;
     if value.is_object() {
         Ok(value)
     } else {
-        Err(AppError(format!("{} is not a JSON object", path.display())))
+        Err(Error::Message(format!(
+            "{} is not a JSON object",
+            path.display()
+        )))
     }
 }
 
@@ -848,14 +857,14 @@ fn set_nested(root: &mut Value, path: &[&str], value: Value) -> Result<()> {
     for key in &path[..path.len() - 1] {
         let object = current
             .as_object_mut()
-            .ok_or_else(|| AppError("Claude settings contain a non-object parent".into()))?;
+            .ok_or_else(|| Error::Message("Claude settings contain a non-object parent".into()))?;
         current = object
             .entry((*key).to_owned())
             .or_insert_with(|| Value::Object(Map::new()));
     }
     current
         .as_object_mut()
-        .ok_or_else(|| AppError("Claude settings contain a non-object parent".into()))?
+        .ok_or_else(|| Error::Message("Claude settings contain a non-object parent".into()))?
         .insert(path[path.len() - 1].to_owned(), value);
     Ok(())
 }
@@ -931,13 +940,13 @@ fn user_id() -> Result<String> {
     let output = Command::new("/usr/bin/id")
         .arg("-u")
         .output()
-        .map_err(|error| AppError(format!("could not run `id -u`: {error}")))?;
+        .map_err(|error| Error::Message(format!("could not run `id -u`: {error}")))?;
     if !output.status.success() {
-        return Err(AppError("`id -u` failed".into()));
+        return Err(Error::Message("`id -u` failed".into()));
     }
     String::from_utf8(output.stdout)
         .map(|value| value.trim().to_owned())
-        .map_err(|_| AppError("`id -u` returned non-UTF-8 output".into()))
+        .map_err(|_| Error::Message("`id -u` returned non-UTF-8 output".into()))
 }
 
 #[cfg(target_os = "macos")]
@@ -945,12 +954,12 @@ fn launchctl<const N: usize>(arguments: [&str; N]) -> Result<()> {
     let output = Command::new("/bin/launchctl")
         .args(arguments)
         .output()
-        .map_err(|error| AppError(format!("could not run launchctl: {error}")))?;
+        .map_err(|error| Error::Message(format!("could not run launchctl: {error}")))?;
     if output.status.success() {
         return Ok(());
     }
     let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    Err(AppError(if detail.is_empty() {
+    Err(Error::Message(if detail.is_empty() {
         format!("launchctl failed with {}", output.status)
     } else {
         format!("launchctl failed: {detail}")
@@ -968,7 +977,7 @@ fn start_background_service(path: &Path) -> Result<()> {
         "bootstrap",
         &launch_domain()?,
         path.to_str()
-            .ok_or_else(|| AppError("LaunchAgent path is not UTF-8".into()))?,
+            .ok_or_else(|| Error::Message("LaunchAgent path is not UTF-8".into()))?,
     ])
 }
 
@@ -998,12 +1007,12 @@ fn systemctl(arguments: &[&str]) -> Result<()> {
         .arg("--user")
         .args(arguments)
         .output()
-        .map_err(|error| AppError(format!("could not run `systemctl --user`: {error}")))?;
+        .map_err(|error| Error::Message(format!("could not run `systemctl --user`: {error}")))?;
     if output.status.success() {
         return Ok(());
     }
     let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    Err(AppError(if detail.is_empty() {
+    Err(Error::Message(if detail.is_empty() {
         format!("systemctl --user failed with {}", output.status)
     } else {
         format!("systemctl --user failed: {detail}")
@@ -1046,7 +1055,7 @@ fn refresh_background_services() -> Result<()> {
 fn systemd_quote(path: &Path) -> Result<String> {
     let path = path
         .to_str()
-        .ok_or_else(|| AppError("Subhub executable path is not UTF-8".into()))?;
+        .ok_or_else(|| Error::Message("Subhub executable path is not UTF-8".into()))?;
     Ok(format!(
         "\"{}\"",
         path.replace('\\', "\\\\").replace('"', "\\\"")

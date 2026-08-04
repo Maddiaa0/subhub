@@ -1,4 +1,4 @@
-use crate::{AppError, Result};
+use crate::{Error, Result};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
@@ -55,28 +55,33 @@ pub async fn fetch_usage(
     headers.insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {access_token}"))
-            .map_err(|error| AppError(error.to_string()))?,
+            .map_err(|error| Error::Message(error.to_string()))?,
     );
     headers.insert(
         "chatgpt-account-id",
-        HeaderValue::from_str(account_id).map_err(|error| AppError(error.to_string()))?,
+        HeaderValue::from_str(account_id).map_err(|error| Error::Message(error.to_string()))?,
     );
     let response = client
         .get(USAGE_URL)
         .headers(headers)
         .send()
         .await
-        .map_err(|error| AppError(format!("Codex usage audit failed: {error}")))?;
-    if !response.status().is_success() {
-        return Err(AppError(format!(
-            "Codex usage audit returned HTTP {}",
-            response.status()
-        )));
+        .map_err(|error| Error::audit_transient(format!("Codex usage audit failed: {error}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        let message = format!("Codex usage audit returned HTTP {status}");
+        return Err(
+            if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                Error::audit_transient(message)
+            } else {
+                Error::audit_fatal(message)
+            },
+        );
     }
     response
         .json()
         .await
-        .map_err(|error| AppError(format!("invalid Codex usage response: {error}")))
+        .map_err(|error| Error::audit_transient(format!("invalid Codex usage response: {error}")))
 }
 
 #[cfg(test)]
