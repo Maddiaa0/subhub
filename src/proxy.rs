@@ -629,10 +629,37 @@ async fn select_credential(
             utilization(&health, &a.name, model).total_cmp(&utilization(&health, &b.name, model))
         })
         .cloned();
+    let selected = selected.or_else(|| {
+        credentials
+            .iter()
+            .filter(|credential| {
+                credential.provider == provider
+                    && exclude != Some(credential.name.as_str())
+                    && health.get(&credential.name).is_some_and(|entry| {
+                        entry.usage.is_none()
+                            && entry.error.as_deref().is_some_and(advisory_audit_error)
+                    })
+            })
+            .min_by_key(|credential| health[&credential.name].checked_at)
+            .cloned()
+    });
     if let Some(credential) = &selected {
         *state.selected.lock().await.slot(provider) = Some(credential.name.clone());
     }
     selected
+}
+
+fn advisory_audit_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    ![
+        "unauthorized",
+        "forbidden",
+        "lacks user",
+        "refresh",
+        "no account id",
+    ]
+    .iter()
+    .any(|blocked| error.contains(blocked))
 }
 
 fn utilization(health: &HashMap<String, CredentialHealth>, name: &str, model: Option<&str>) -> f64 {
@@ -863,6 +890,22 @@ mod tests {
         assert!(message.contains("could not refresh"));
         assert!(message.contains("subhub add ready --force"));
         assert!(!message.contains("access_token"));
+    }
+
+    #[tokio::test]
+    async fn transient_audit_failure_can_fall_back_to_inference() {
+        let state = test_state();
+        let mut health = state.health.write().await;
+        health.get_mut("full").unwrap().usage = None;
+        health.get_mut("full").unwrap().error = Some("usage request timed out".into());
+        health.get_mut("ready").unwrap().usage = None;
+        health.get_mut("ready").unwrap().error = Some("OAuth token is unauthorized".into());
+        drop(health);
+
+        let selected = select_credential(&state, None, None, Provider::Claude)
+            .await
+            .unwrap();
+        assert_eq!(selected.name, "full");
     }
 
     #[tokio::test]
