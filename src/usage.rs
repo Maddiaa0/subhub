@@ -1,4 +1,4 @@
-use crate::{AppError, Result};
+use crate::{Error, Result};
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -161,15 +161,14 @@ impl UsageClient {
             .timeout(Duration::from_secs(30))
             .send()
             .await
-            .map_err(|error| AppError(format!("usage request failed: {error}")))?;
+            .map_err(|error| Error::audit_transient(format!("usage request failed: {error}")))?;
 
         match response.status() {
-            StatusCode::OK => response
-                .json()
-                .await
-                .map_err(|error| AppError(format!("invalid usage response: {error}"))),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(AppError(
-                "OAuth token is unauthorized or lacks user:profile scope".into(),
+            StatusCode::OK => response.json().await.map_err(|error| {
+                Error::audit_transient(format!("invalid usage response: {error}"))
+            }),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::audit_fatal(
+                "OAuth token is unauthorized or lacks user:profile scope",
             )),
             StatusCode::TOO_MANY_REQUESTS => {
                 let retry = response
@@ -177,16 +176,21 @@ impl UsageClient {
                     .get("retry-after")
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or("300");
-                Err(AppError(format!(
+                Err(Error::audit_transient(format!(
                     "usage endpoint rate limited; retry after {retry}"
                 )))
             }
             status => {
                 let body = response.text().await.unwrap_or_default();
-                Err(AppError(format!(
+                let message = format!(
                     "usage endpoint returned {status}: {}",
                     body.chars().take(300).collect::<String>()
-                )))
+                );
+                if status.is_server_error() {
+                    Err(Error::audit_transient(message))
+                } else {
+                    Err(Error::audit_fatal(message))
+                }
             }
         }
     }
