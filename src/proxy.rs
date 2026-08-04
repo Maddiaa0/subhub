@@ -105,8 +105,15 @@ struct ProxyState {
     health: Arc<RwLock<HashMap<String, CredentialHealth>>>,
     selected: Arc<Mutex<SelectedAccounts>>,
     refresh_lock: Arc<Mutex<()>>,
+    refresh_backoff: Arc<Mutex<HashMap<String, RefreshBackoff>>>,
     client_token: Arc<String>,
     reserve_percent: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RefreshBackoff {
+    failures: u32,
+    retry_at: u64,
 }
 
 pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
@@ -164,6 +171,7 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         health: Arc::default(),
         selected: Arc::new(Mutex::new(initial_selected)),
         refresh_lock: Arc::default(),
+        refresh_backoff: Arc::default(),
         client_token: Arc::new(client_token.clone()),
         reserve_percent: options.reserve_percent,
     };
@@ -174,6 +182,14 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         loop {
             ticker.tick().await;
             audit_all(&audit_state).await;
+        }
+    });
+    let refresh_state = state.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            ticker.tick().await;
+            refresh_due_credentials(&refresh_state).await;
         }
     });
 
@@ -199,6 +215,30 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         })
         .await
         .map_err(|error| AppError(format!("proxy server failed: {error}")))
+}
+
+async fn refresh_due_credentials(state: &ProxyState) {
+    let deadline = chrono::Utc::now().timestamp_millis() + 60_000;
+    let credentials = state.credentials.read().await.clone();
+    for credential in credentials {
+        if credential.provider == Provider::Claude
+            && credential
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= deadline)
+            && refresh_retry_ready(state, &credential.name).await
+        {
+            let _ = refresh_credential(state, &credential.name, false, None).await;
+        }
+    }
+}
+
+async fn refresh_retry_ready(state: &ProxyState, name: &str) -> bool {
+    state
+        .refresh_backoff
+        .lock()
+        .await
+        .get(name)
+        .is_none_or(|backoff| backoff.retry_at <= now())
 }
 
 #[derive(Deserialize)]
@@ -379,7 +419,28 @@ async fn refresh_credential(
     {
         return Ok(current);
     }
-    let refreshed = crate::refresh_claude_credential(&state.client, name).await?;
+    let refreshed = match crate::refresh_claude_credential(&state.client, name).await {
+        Ok(refreshed) => {
+            state.refresh_backoff.lock().await.remove(name);
+            refreshed
+        }
+        Err(error) => {
+            let mut backoffs = state.refresh_backoff.lock().await;
+            let failures = backoffs
+                .get(name)
+                .map_or(1, |backoff| backoff.failures.saturating_add(1));
+            let delay = 30_u64.saturating_mul(2_u64.saturating_pow(failures.min(6) - 1));
+            let jitter = rand::random_range(0..=15);
+            backoffs.insert(
+                name.to_owned(),
+                RefreshBackoff {
+                    failures,
+                    retry_at: now() + delay.min(1_800) + jitter,
+                },
+            );
+            return Err(error);
+        }
+    };
     if let Some(current) = state
         .credentials
         .write()
@@ -857,6 +918,7 @@ mod tests {
             ]))),
             selected: Arc::default(),
             refresh_lock: Arc::default(),
+            refresh_backoff: Arc::default(),
             client_token: Arc::new("local-secret".into()),
             reserve_percent: 1.0,
         }
@@ -906,6 +968,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(selected.name, "full");
+    }
+
+    #[tokio::test]
+    async fn refresh_backoff_suppresses_retries_until_due() {
+        let state = test_state();
+        state.refresh_backoff.lock().await.insert(
+            "ready".into(),
+            RefreshBackoff {
+                failures: 3,
+                retry_at: now() + 300,
+            },
+        );
+        assert!(!refresh_retry_ready(&state, "ready").await);
+        state
+            .refresh_backoff
+            .lock()
+            .await
+            .get_mut("ready")
+            .unwrap()
+            .retry_at = now();
+        assert!(refresh_retry_ready(&state, "ready").await);
     }
 
     #[tokio::test]
