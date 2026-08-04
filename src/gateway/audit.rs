@@ -9,7 +9,7 @@ use crate::{Error, Result};
 pub(super) async fn audit_all(state: &ProxyState) {
     let credentials = state.credentials.read().await.clone();
     for credential in &credentials {
-        let credential = if credential.provider == Provider::Claude
+        let credential = if credential.provider.supports_refresh()
             && credential.expires_at.is_some_and(|expires_at| {
                 expires_at <= chrono::Utc::now().timestamp_millis() + 60_000
             }) {
@@ -46,7 +46,7 @@ pub(super) async fn audit_all(state: &ProxyState) {
                 .await
                 .map(CredentialUsage::Claude)
         };
-        if credential.provider == Provider::Claude
+        if credential.provider.supports_refresh()
             && result
                 .as_ref()
                 .is_err_and(|error| error.kind() == ErrorKind::FatalAudit)

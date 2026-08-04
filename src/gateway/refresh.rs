@@ -1,12 +1,12 @@
 use super::state::{ProxyState, RefreshBackoff, now, safe_error};
-use crate::provider::{Provider, StoredCredential};
+use crate::provider::StoredCredential;
 use crate::{Result, refresh_claude_credential};
 
 pub(super) async fn refresh_due_credentials(state: &ProxyState) {
     let deadline = chrono::Utc::now().timestamp_millis() + 60_000;
     let credentials = state.credentials.read().await.clone();
     for credential in credentials {
-        if credential.provider == Provider::Claude
+        if credential.provider.supports_refresh()
             && credential
                 .expires_at
                 .is_some_and(|expires_at| expires_at <= deadline)
