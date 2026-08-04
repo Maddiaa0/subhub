@@ -1,5 +1,5 @@
 use chrono::{DateTime, Local};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(target_os = "linux")]
@@ -85,6 +85,9 @@ enum Commands {
     Set {
         /// Friendly name of the saved credential
         name: String,
+        /// Require the credential to belong to this provider
+        #[arg(long, value_enum)]
+        provider: Option<ProviderArg>,
     },
     /// Query subscription usage for every saved credential
     Audit {
@@ -136,7 +139,11 @@ enum GatewayCommands {
     /// Restart the installed background gateway
     Restart,
     /// Show installation, process, and gateway health
-    Status,
+    Status {
+        /// Show credential health only for this provider
+        #[arg(long, value_enum)]
+        provider: Option<ProviderArg>,
+    },
     /// Print the local gateway authentication token
     AuthToken,
     /// Internal Claude Code status-line renderer
@@ -175,6 +182,21 @@ pub(crate) enum Provider {
     #[default]
     Claude,
     Codex,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProviderArg {
+    Claude,
+    Codex,
+}
+
+impl From<ProviderArg> for Provider {
+    fn from(provider: ProviderArg) -> Self {
+        match provider {
+            ProviderArg::Claude => Self::Claude,
+            ProviderArg::Codex => Self::Codex,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -262,7 +284,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             device_auth,
         } => add(&path, &mut index, &name, force, device_auth),
         Commands::List => list(&index),
-        Commands::Set { name } => set(&path, &mut index, &name),
+        Commands::Set { name, provider } => set(&path, &mut index, &name, provider.map(Into::into)),
         Commands::Audit { json } => {
             let credentials = stored_credentials(&index)?;
             runtime()?.block_on(audit(credentials, json))
@@ -297,7 +319,7 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
         GatewayCommands::Start => lifecycle::start(),
         GatewayCommands::Stop => lifecycle::stop(),
         GatewayCommands::Restart => lifecycle::restart(),
-        GatewayCommands::Status => lifecycle::status(),
+        GatewayCommands::Status { provider } => lifecycle::status(provider.map(Into::into)),
         GatewayCommands::AuthToken => {
             println!("{}", lifecycle::read_gateway_token()?);
             Ok(())
@@ -465,7 +487,12 @@ fn list(index: &Index) -> Result<()> {
     Ok(())
 }
 
-fn set(path: &Path, index: &mut Index, name: &str) -> Result<()> {
+fn set(
+    path: &Path,
+    index: &mut Index,
+    name: &str,
+    expected_provider: Option<Provider>,
+) -> Result<()> {
     validate_name(name)?;
     if !index.contains(name) {
         return Err(AppError(format!(
@@ -483,6 +510,15 @@ fn set(path: &Path, index: &mut Index, name: &str) -> Result<()> {
             "{error}; refresh it with `subhub add {name} --force`"
         ))
     })?;
+    if let Some(expected) = expected_provider
+        && expected != entry.provider
+    {
+        return Err(AppError(format!(
+            "credential \"{name}\" belongs to {}, not {}",
+            provider_name(entry.provider),
+            provider_name(expected)
+        )));
+    }
     if entry.provider == Provider::Claude {
         let credential = serde_json::to_string(&entry.credential)?;
         validate_credential(&credential)?;
@@ -499,6 +535,13 @@ fn set(path: &Path, index: &mut Index, name: &str) -> Result<()> {
         Err(error) => eprintln!("warning: running gateway was not switched: {error}"),
     }
     Ok(())
+}
+
+pub(crate) fn provider_name(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "claude",
+        Provider::Codex => "codex",
+    }
 }
 
 #[cfg(test)]

@@ -50,12 +50,14 @@ subhub add <name> [--force] [--device-auth]
                                   Save or replace an account
                                   (--device-auth: Codex device-code login)
 subhub list                       List accounts and their providers
-subhub set <name>                 Select an account
+subhub set <name> [--provider claude|codex]
+                                  Select an account with provider validation
 subhub audit [--json]             Show subscription usage
 
 subhub gateway install            Install and start the background gateway
 subhub gateway reinstall          Uninstall then install, preserving accounts
-subhub gateway status             Show gateway health
+subhub gateway status [--provider claude|codex]
+                                  Show gateway health, optionally filtered
 subhub gateway start|stop|restart Manage the gateway
 subhub gateway uninstall [--purge]
 subhub gateway serve              Run the gateway in the foreground

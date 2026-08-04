@@ -267,7 +267,7 @@ pub(crate) fn restart() -> Result<()> {
     }
 }
 
-pub(crate) fn status() -> Result<()> {
+pub(crate) fn status(provider: Option<crate::Provider>) -> Result<()> {
     let installed = background_service_path()?.exists() && install_state_path()?.exists();
     let running = background_service_running();
     println!("Installed: {}", yes_no(installed));
@@ -287,7 +287,7 @@ pub(crate) fn status() -> Result<()> {
     );
     if running {
         match fetch_gateway_status() {
-            Ok(status) => print_gateway_health(&status),
+            Ok(status) => print_gateway_health(&status, provider),
             Err(error) => println!("Gateway:   not reachable ({error})"),
         }
     }
@@ -297,7 +297,7 @@ pub(crate) fn status() -> Result<()> {
     Ok(())
 }
 
-fn print_gateway_health(status: &Value) {
+fn print_gateway_health(status: &Value, provider_filter: Option<crate::Provider>) {
     println!("Gateway:   reachable");
     let selected = status.get("selected").and_then(Value::as_object);
     let credentials = status.get("credentials").and_then(Value::as_object);
@@ -310,6 +310,9 @@ fn print_gateway_health(status: &Value) {
             .get("provider")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        if provider_filter.is_some_and(|filter| crate::provider_name(filter) != provider) {
+            continue;
+        }
         let active = selected
             .and_then(|selected| selected.get(provider))
             .and_then(Value::as_str)
