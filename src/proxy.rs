@@ -466,7 +466,7 @@ async fn proxy(State(state): State<ProxyState>, request: Request) -> Response {
         None => {
             return error_response(
                 StatusCode::TOO_MANY_REQUESTS,
-                "no audited credential currently has usage available",
+                &routing_error_message(&state, provider).await,
             );
         }
     };
@@ -513,6 +513,51 @@ async fn proxy(State(state): State<ProxyState>, request: Request) -> Response {
         }
         Ok(response) => into_axum_response(response),
         Err(error) => error_response(StatusCode::BAD_GATEWAY, &error.to_string()),
+    }
+}
+
+async fn routing_error_message(state: &ProxyState, provider: Provider) -> String {
+    let credentials = state.credentials.read().await;
+    let health = state.health.read().await;
+    let relevant: Vec<_> = credentials
+        .iter()
+        .filter(|credential| credential.provider == provider)
+        .collect();
+    if relevant.is_empty() {
+        return match provider {
+            Provider::Claude => "no Claude credential configured; run `subhub add <name>`".into(),
+            Provider::Codex => "no Codex credential configured; run `subhub add <name>`".into(),
+        };
+    }
+    if let Some((credential, error)) = relevant.iter().find_map(|credential| {
+        health
+            .get(&credential.name)
+            .and_then(|entry| entry.error.as_deref())
+            .filter(|error| error.contains("refresh"))
+            .map(|error| (*credential, error))
+    }) {
+        return format!(
+            "credential `{}` could not refresh: {}; run `subhub add {} --force` if its refresh token was revoked",
+            credential.name, error, credential.name
+        );
+    }
+    if relevant.iter().all(|credential| {
+        health
+            .get(&credential.name)
+            .is_some_and(|entry| entry.usage.is_some())
+    }) {
+        return "all credentials are at their configured usage limit; check `subhub audit` for reset times".into();
+    }
+    let detail = relevant.iter().find_map(|credential| {
+        health
+            .get(&credential.name)
+            .and_then(|entry| entry.error.as_deref())
+    });
+    match detail {
+        Some(error) => {
+            format!("credential usage is unknown because its latest audit failed: {error}")
+        }
+        None => "credentials are still being audited; retry shortly".into(),
     }
 }
 
@@ -779,6 +824,21 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(selected_again.name, "ready");
+    }
+
+    #[tokio::test]
+    async fn routing_error_explains_refresh_recovery() {
+        let state = test_state();
+        let mut health = state.health.write().await;
+        health.get_mut("ready").unwrap().usage = None;
+        health.get_mut("ready").unwrap().error =
+            Some("Claude OAuth refresh returned 400 Bad Request".into());
+        drop(health);
+
+        let message = routing_error_message(&state, Provider::Claude).await;
+        assert!(message.contains("could not refresh"));
+        assert!(message.contains("subhub add ready --force"));
+        assert!(!message.contains("access_token"));
     }
 
     #[tokio::test]
