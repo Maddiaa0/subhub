@@ -607,8 +607,37 @@ pub(crate) async fn refresh_claude_credential(
         .filter(|token| !token.is_empty())
         .ok_or_else(|| AppError(format!("credential \"{name}\" has no refresh token")))?
         .to_owned();
+    let refreshed = request_claude_refresh(client, CLAUDE_TOKEN_URL, &refresh_token).await?;
+    oauth.insert("accessToken".into(), Value::String(refreshed.access_token));
+    if let Some(refresh_token) = refreshed.refresh_token.filter(|token| !token.is_empty()) {
+        oauth.insert("refreshToken".into(), Value::String(refresh_token));
+    }
+    let expires_at = chrono::Utc::now().timestamp_millis() + refreshed.expires_in * 1000;
+    oauth.insert("expiresAt".into(), Value::Number(expires_at.into()));
+
+    let encoded = serde_json::to_string(&entry)?;
+    credential_write(VAULT_SERVICE, name, &encoded)?;
+    let index = load_or_migrate_index(&index_path()?, &legacy_index_path()?)?;
+    if index.active_for(Provider::Claude) == Some(name) {
+        credential_write(
+            ACTIVE_SERVICE,
+            &current_user()?,
+            &serde_json::to_string(&entry.credential)?,
+        )?;
+    }
+    gateway_credentials()?
+        .into_iter()
+        .find(|credential| credential.name == name)
+        .ok_or_else(|| AppError(format!("refreshed credential \"{name}\" disappeared")))
+}
+
+async fn request_claude_refresh(
+    client: &reqwest::Client,
+    token_url: &str,
+    refresh_token: &str,
+) -> Result<ClaudeRefreshResponse> {
     let response = client
-        .post(CLAUDE_TOKEN_URL)
+        .post(token_url)
         .header("anthropic-beta", "oauth-2025-04-20")
         .header(
             "user-agent",
@@ -642,27 +671,7 @@ pub(crate) async fn refresh_claude_credential(
             "Claude OAuth refresh returned invalid token data".into(),
         ));
     }
-    oauth.insert("accessToken".into(), Value::String(refreshed.access_token));
-    if let Some(refresh_token) = refreshed.refresh_token.filter(|token| !token.is_empty()) {
-        oauth.insert("refreshToken".into(), Value::String(refresh_token));
-    }
-    let expires_at = chrono::Utc::now().timestamp_millis() + refreshed.expires_in * 1000;
-    oauth.insert("expiresAt".into(), Value::Number(expires_at.into()));
-
-    let encoded = serde_json::to_string(&entry)?;
-    credential_write(VAULT_SERVICE, name, &encoded)?;
-    let index = load_or_migrate_index(&index_path()?, &legacy_index_path()?)?;
-    if index.active_for(Provider::Claude) == Some(name) {
-        credential_write(
-            ACTIVE_SERVICE,
-            &current_user()?,
-            &serde_json::to_string(&entry.credential)?,
-        )?;
-    }
-    gateway_credentials()?
-        .into_iter()
-        .find(|credential| credential.name == name)
-        .ok_or_else(|| AppError(format!("refreshed credential \"{name}\" disappeared")))
+    Ok(refreshed)
 }
 
 #[derive(Serialize)]
@@ -1218,7 +1227,59 @@ fn save_json_file(path: &Path, value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, routing::post};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::oneshot;
+
+    async fn refresh_server(
+        response: Value,
+    ) -> (String, oneshot::Receiver<(Value, axum::http::HeaderMap)>) {
+        let (sent, received) = oneshot::channel();
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Some(sent)));
+        let app = Router::new().route(
+            "/token",
+            post({
+                let sent = sent.clone();
+                move |headers, Json(body): Json<Value>| {
+                    let sent = sent.clone();
+                    let response = response.clone();
+                    async move {
+                        if let Some(sent) = sent.lock().unwrap().take() {
+                            let _ = sent.send((body, headers));
+                        }
+                        Json(response)
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/token"), received)
+    }
+
+    #[tokio::test]
+    async fn claude_refresh_matches_provider_protocol_and_accepts_rotation() {
+        let (url, received) = refresh_server(serde_json::json!({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600
+        }))
+        .await;
+
+        let refreshed = request_claude_refresh(&reqwest::Client::new(), &url, "old-refresh")
+            .await
+            .unwrap();
+        let (body, headers) = received.await.unwrap();
+
+        assert_eq!(body["grant_type"], "refresh_token");
+        assert_eq!(body["refresh_token"], "old-refresh");
+        assert_eq!(body["client_id"], CLAUDE_CLIENT_ID);
+        assert_eq!(headers["anthropic-beta"], "oauth-2025-04-20");
+        assert_eq!(refreshed.access_token, "new-access");
+        assert_eq!(refreshed.refresh_token.as_deref(), Some("new-refresh"));
+        assert_eq!(refreshed.expires_in, 3600);
+    }
 
     #[test]
     fn adding_names_is_sorted_and_marks_active() {
@@ -1234,13 +1295,12 @@ mod tests {
 
     #[test]
     fn legacy_index_active_slot_backs_both_providers() {
-        let index: Index =
-            serde_json::from_value(serde_json::json!({
-                "version": 1,
-                "active": "personal",
-                "credentials": ["personal"]
-            }))
-            .unwrap();
+        let index: Index = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "active": "personal",
+            "credentials": ["personal"]
+        }))
+        .unwrap();
         assert_eq!(index.active_for(Provider::Claude), Some("personal"));
         assert_eq!(index.active_for(Provider::Codex), Some("personal"));
         assert_eq!(index.active_names(), ["personal"]);
