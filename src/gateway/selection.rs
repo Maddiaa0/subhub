@@ -91,10 +91,10 @@ pub(super) async fn routing_error_message(state: &ProxyState, provider: Provider
         .filter(|credential| credential.provider == provider)
         .collect();
     if relevant.is_empty() {
-        return match provider {
-            Provider::Claude => "no Claude credential configured; run `subhub add <name>`".into(),
-            Provider::Codex => "no Codex credential configured; run `subhub add <name>`".into(),
-        };
+        return format!(
+            "no {} credential configured; run `subhub add <name>`",
+            provider.display_name()
+        );
     }
     if let Some((credential, error)) = relevant.iter().find_map(|credential| {
         health

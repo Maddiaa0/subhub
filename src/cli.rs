@@ -10,7 +10,7 @@ use crate::credentials::vault::{
     ACTIVE_SERVICE, VAULT_SERVICE, VaultEntry, credential_read, credential_write, current_user,
     validate_credential, vault_read,
 };
-use crate::provider::{Provider, provider_name};
+use crate::provider::Provider;
 use crate::{Error, Result, codex, gateway, runtime, service, usage};
 use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -338,24 +338,15 @@ fn list(index: &Index) -> Result<()> {
         let provider = vault_read(name)
             .ok()
             .and_then(|stored| serde_json::from_str::<Value>(&stored).ok())
-            .and_then(|entry| {
-                entry
-                    .get("provider")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| "claude".into());
-        let marker = if index.active_for(if provider == "codex" {
-            Provider::Codex
-        } else {
-            Provider::Claude
-        }) == Some(name)
-        {
+            .and_then(|entry| entry.get("provider").cloned())
+            .and_then(|value| serde_json::from_value::<Provider>(value).ok())
+            .unwrap_or_default();
+        let marker = if index.active_for(provider) == Some(name) {
             "*"
         } else {
             " "
         };
-        println!("{marker} {name} [{provider}]");
+        println!("{marker} {name} [{}]", provider.name());
     }
     Ok(())
 }
@@ -388,8 +379,8 @@ fn set(
     {
         return Err(Error::Message(format!(
             "credential \"{name}\" belongs to {}, not {}",
-            provider_name(entry.provider),
-            provider_name(expected)
+            entry.provider.name(),
+            expected.name()
         )));
     }
     if entry.provider == Provider::Claude {

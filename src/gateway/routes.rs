@@ -5,7 +5,6 @@ use super::selection::{
     mark_failed, routing_error_message, select_credential, set_selected_account,
 };
 use super::state::ProxyState;
-use crate::codex;
 use crate::provider::{Provider, StoredCredential};
 use crate::{Error, Result};
 use axum::body::{Body, Bytes};
@@ -13,8 +12,6 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use serde::Deserialize;
-
-const UPSTREAM: &str = "https://api.anthropic.com";
 
 #[derive(Deserialize)]
 pub(super) struct SelectAccountRequest {
@@ -129,11 +126,7 @@ pub(super) async fn proxy(State(state): State<ProxyState>, request: Request) -> 
         return error_response(StatusCode::UNAUTHORIZED, "invalid local proxy token");
     }
     let (parts, body) = request.into_parts();
-    let provider = if parts.uri.path().starts_with("/openai/") {
-        Provider::Codex
-    } else {
-        Provider::Claude
-    };
+    let provider = Provider::from_request_path(parts.uri.path());
     let bytes = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -163,7 +156,7 @@ pub(super) async fn proxy(State(state): State<ProxyState>, request: Request) -> 
     };
     match forward(&state, &parts, bytes.clone(), &first).await {
         Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-            if first.provider == Provider::Claude
+            if first.provider.supports_refresh()
                 && let Ok(refreshed) =
                     refresh_credential(&state, &first.name, true, Some(&first.access_token)).await
             {
@@ -218,24 +211,17 @@ async fn forward(
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or("/");
-    let (upstream, path) = if credential.provider == Provider::Codex {
-        (
-            codex::RESPONSES_UPSTREAM,
-            path.strip_prefix("/openai").unwrap_or(path),
-        )
-    } else {
-        (UPSTREAM, path)
-    };
+    let upstream = credential.provider.upstream();
+    let path = credential.provider.rewrite_upstream_path(path);
     let mut request = state
         .client
         .request(parts.method.clone(), format!("{upstream}{path}"))
         .bearer_auth(&credential.access_token)
         .body(body);
-    if credential.provider == Provider::Codex {
-        request = request.header("openai-beta", "codex-1");
-    } else {
-        request = request.header("anthropic-beta", oauth_beta_header(&parts.headers));
-    }
+    request = match credential.provider {
+        Provider::Claude => request.header("anthropic-beta", oauth_beta_header(&parts.headers)),
+        Provider::Codex => request.header("openai-beta", "codex-1"),
+    };
     if let Some(account) = &credential.account_id {
         request = request.header("chatgpt-account-id", account);
     }
