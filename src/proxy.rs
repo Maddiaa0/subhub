@@ -424,11 +424,35 @@ async fn status(State(state): State<ProxyState>, headers: HeaderMap) -> Response
     if !authorized(&state, &headers) {
         return error_response(StatusCode::UNAUTHORIZED, "invalid local proxy token");
     }
+    let mut credentials = serde_json::to_value(state.health.read().await.clone())
+        .unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(entries) = credentials.as_object_mut() {
+        let now = chrono::Utc::now().timestamp_millis();
+        for credential in state.credentials.read().await.iter() {
+            if let Some(entry) = entries
+                .get_mut(&credential.name)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                let token_state = match credential.expires_at {
+                    Some(expires_at) if expires_at <= now => "expired",
+                    Some(expires_at) if expires_at <= now + 60_000 => "refresh_due",
+                    Some(_) => "valid",
+                    None => "unknown",
+                };
+                entry.insert("token_state".into(), token_state.into());
+                entry.insert("token_expires_at".into(), credential.expires_at.into());
+                entry.insert(
+                    "provider".into(),
+                    serde_json::to_value(credential.provider).unwrap_or_default(),
+                );
+            }
+        }
+    }
     json_response(
         StatusCode::OK,
         serde_json::json!({
             "selected": state.selected.lock().await.clone(),
-            "credentials": state.health.read().await.clone()
+            "credentials": credentials
         }),
     )
 }
