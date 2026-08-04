@@ -1,4 +1,5 @@
 use crate::{AppError, Result};
+use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -55,19 +56,29 @@ pub struct UsageSnapshot {
 
 impl UsageSnapshot {
     pub fn tightest_utilization(&self, model: Option<&str>) -> Option<f64> {
+        self.tightest_utilization_at(model, Utc::now())
+    }
+
+    fn tightest_utilization_at(&self, model: Option<&str>, now: DateTime<Utc>) -> Option<f64> {
         let mut values = Vec::new();
-        values.extend(self.five_hour.as_ref().and_then(|w| w.utilization));
-        values.extend(self.seven_day.as_ref().and_then(|w| w.utilization));
+        values.extend(current_window_utilization(self.five_hour.as_ref(), now));
+        values.extend(current_window_utilization(self.seven_day.as_ref(), now));
 
         let model = model.unwrap_or_default().to_ascii_lowercase();
         if model.contains("opus") {
-            values.extend(self.seven_day_opus.as_ref().and_then(|w| w.utilization));
+            values.extend(current_window_utilization(
+                self.seven_day_opus.as_ref(),
+                now,
+            ));
         }
         if model.contains("sonnet") {
-            values.extend(self.seven_day_sonnet.as_ref().and_then(|w| w.utilization));
+            values.extend(current_window_utilization(
+                self.seven_day_sonnet.as_ref(),
+                now,
+            ));
         }
         for limit in &self.limits {
-            if limit.is_active == Some(false) {
+            if limit.is_active == Some(false) || reset_has_passed(limit.resets_at.as_deref(), now) {
                 continue;
             }
             let applies = limit
@@ -100,6 +111,18 @@ impl UsageSnapshot {
             .map(|used| used < 100.0 - reserve_percent)
             .unwrap_or(true)
     }
+}
+
+fn current_window_utilization(window: Option<&UsageWindow>, now: DateTime<Utc>) -> Option<f64> {
+    window
+        .filter(|window| !reset_has_passed(window.resets_at.as_deref(), now))
+        .and_then(|window| window.utilization)
+}
+
+fn reset_has_passed(reset: Option<&str>, now: DateTime<Utc>) -> bool {
+    reset
+        .and_then(|reset| DateTime::parse_from_rfc3339(reset).ok())
+        .is_some_and(|reset| reset <= now)
 }
 
 #[derive(Clone)]
@@ -192,5 +215,46 @@ mod tests {
         );
         assert!(!usage.eligible(Some("claude-opus-4"), 1.0));
         assert!(usage.eligible(Some("claude-sonnet-4"), 1.0));
+    }
+
+    #[test]
+    fn expired_windows_do_not_keep_credentials_blocked() {
+        let usage: UsageSnapshot = serde_json::from_value(serde_json::json!({
+            "five_hour": {
+                "utilization": 100.0,
+                "resets_at": "2030-08-01T12:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 40.0,
+                "resets_at": "2030-08-08T13:00:00Z"
+            }
+        }))
+        .unwrap();
+        let now = DateTime::parse_from_rfc3339("2030-08-01T13:00:00Z")
+            .unwrap()
+            .to_utc();
+
+        assert_eq!(usage.tightest_utilization_at(None, now), Some(40.0));
+    }
+
+    #[test]
+    fn expired_model_limit_does_not_keep_credentials_blocked() {
+        let usage: UsageSnapshot = serde_json::from_value(serde_json::json!({
+            "five_hour": {"utilization": 20.0, "resets_at": null},
+            "limits": [{
+                "percent": 100.0,
+                "resets_at": "2030-08-01T12:00:00Z",
+                "scope": {"model": {"id": "claude-sonnet"}}
+            }]
+        }))
+        .unwrap();
+        let now = DateTime::parse_from_rfc3339("2030-08-01T13:00:00Z")
+            .unwrap()
+            .to_utc();
+
+        assert_eq!(
+            usage.tightest_utilization_at(Some("claude-sonnet-4"), now),
+            Some(20.0)
+        );
     }
 }

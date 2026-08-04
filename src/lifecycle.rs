@@ -360,13 +360,7 @@ fn fetch_gateway_status() -> Result<Value> {
 
 fn format_statusline_segment(status: &Value) -> String {
     let mut parts = Vec::new();
-    for (provider, label) in [("claude", "Subhub"), ("codex", "Codex")] {
-        let Some(selected) = status
-            .pointer(&format!("/selected/{provider}"))
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
+    if let Some(selected) = status.pointer("/selected/claude").and_then(Value::as_str) {
         let usage = status
             .get("credentials")
             .and_then(|credentials| credentials.get(selected))
@@ -390,7 +384,7 @@ fn format_statusline_segment(status: &Value) -> String {
                     .and_then(Value::as_f64)
             });
 
-        parts.push(format!("{label}: {selected}"));
+        parts.push(format!("Subhub: {selected}"));
         if let Some(five) = five {
             parts.push(format!("5h {five:.0}%"));
         }
@@ -1178,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn statusline_segment_labels_each_provider() {
+    fn statusline_segment_ignores_codex_provider() {
         let status = serde_json::json!({
             "selected": {"claude": "personal", "codex": "work"},
             "credentials": {
@@ -1192,8 +1186,18 @@ mod tests {
         });
         assert_eq!(
             format_statusline_segment(&status),
-            "Subhub: personal | 5h 12% | Codex: work | 5h 55%"
+            "Subhub: personal | 5h 12%"
         );
+
+        let codex_only = serde_json::json!({
+            "selected": {"claude": null, "codex": "work"},
+            "credentials": {
+                "work": {
+                    "usage": {"rate_limit": {"primary_window": {"used_percent": 55.0}}}
+                }
+            }
+        });
+        assert_eq!(format_statusline_segment(&codex_only), "Subhub: auditing");
     }
 
     #[test]
