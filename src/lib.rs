@@ -2,11 +2,11 @@ mod cli;
 mod codex;
 mod credentials;
 mod error;
+mod gateway;
 mod lifecycle;
 mod observability;
 mod paths;
 mod provider;
-mod proxy;
 pub mod usage;
 
 pub use error::{Error, Result};
@@ -21,7 +21,7 @@ pub(crate) use credentials::vault::{
     VAULT_SERVICE, credential_delete, credential_read, credential_write,
 };
 pub(crate) use paths::{config_base_path, save_json_file};
-pub(crate) use provider::{Provider, StoredCredential, provider_name};
+pub(crate) use provider::{Provider, provider_name};
 
 pub fn run() -> Result<()> {
     if !cfg!(any(target_os = "macos", target_os = "linux")) {

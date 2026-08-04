@@ -11,7 +11,7 @@ use crate::credentials::vault::{
     validate_credential, vault_read,
 };
 use crate::provider::{Provider, provider_name};
-use crate::{Error, Result, codex, lifecycle, proxy, runtime, usage};
+use crate::{Error, Result, codex, gateway, lifecycle, runtime, usage};
 use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -178,7 +178,7 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
             background,
         } => {
             let credentials = stored_credentials(index)?;
-            runtime()?.block_on(proxy::serve(proxy::ServeOptions {
+            runtime()?.block_on(gateway::serve(gateway::ServeOptions {
                 listen,
                 client_token,
                 reserve_percent,
