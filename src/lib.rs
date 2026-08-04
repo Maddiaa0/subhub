@@ -15,6 +15,7 @@ use std::process::{Command, ExitStatus, Stdio};
 
 mod codex;
 mod lifecycle;
+mod observability;
 mod proxy;
 pub mod usage;
 
@@ -144,6 +145,14 @@ enum GatewayCommands {
         #[arg(long, value_enum)]
         provider: Option<ProviderArg>,
     },
+    /// Show recent structured gateway events
+    Logs {
+        /// Maximum number of events to print
+        #[arg(long, default_value_t = 100)]
+        lines: usize,
+    },
+    /// Diagnose gateway installation, routing, and credentials
+    Doctor,
     /// Print the local gateway authentication token
     AuthToken,
     /// Internal Claude Code status-line renderer
@@ -320,6 +329,8 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
         GatewayCommands::Stop => lifecycle::stop(),
         GatewayCommands::Restart => lifecycle::restart(),
         GatewayCommands::Status { provider } => lifecycle::status(provider.map(Into::into)),
+        GatewayCommands::Logs { lines } => lifecycle::logs(lines),
+        GatewayCommands::Doctor => lifecycle::doctor(),
         GatewayCommands::AuthToken => {
             println!("{}", lifecycle::read_gateway_token()?);
             Ok(())
