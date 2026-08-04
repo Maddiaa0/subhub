@@ -1,6 +1,6 @@
 use super::BASE_URL;
+use crate::gateway::protocol::GatewayStatus;
 use crate::{Error, Result, credential_read};
-use serde_json::Value;
 
 pub(crate) fn read_gateway_token() -> Result<String> {
     credential_read(super::GATEWAY_SERVICE, super::GATEWAY_TOKEN_ACCOUNT)
@@ -66,7 +66,7 @@ pub(crate) fn reload_gateway_accounts() -> Result<bool> {
     })
 }
 
-pub(super) fn fetch_gateway_status() -> Result<Value> {
+pub(super) fn fetch_gateway_status() -> Result<GatewayStatus> {
     let token = read_gateway_token()?;
     crate::runtime()?.block_on(async move {
         let response = reqwest::Client::new()

@@ -1,5 +1,6 @@
+use super::protocol::CredentialUsage;
 use super::refresh::refresh_credential;
-use super::state::{CredentialHealth, CredentialUsage, ProxyState, now, safe_error};
+use super::state::{CredentialHealth, ProxyState, now, safe_error};
 use crate::codex;
 use crate::error::{CredentialError, ErrorKind};
 use crate::provider::{Provider, StoredCredential};

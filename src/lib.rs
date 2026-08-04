@@ -22,7 +22,7 @@ pub(crate) use credentials::vault::{
     VAULT_SERVICE, credential_delete, credential_read, credential_write,
 };
 pub(crate) use paths::{config_base_path, save_json_file};
-pub(crate) use provider::{Provider, provider_name};
+pub(crate) use provider::Provider;
 
 pub fn run() -> Result<()> {
     if !cfg!(any(target_os = "macos", target_os = "linux")) {
