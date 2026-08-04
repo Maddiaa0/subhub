@@ -1,4 +1,5 @@
-use super::state::{CredentialHealth, CredentialUsage, ProxyState};
+use super::protocol::CredentialUsage;
+use super::state::{CredentialHealth, ProxyState};
 use crate::error::{CredentialError, ErrorKind};
 use crate::provider::{Provider, StoredCredential};
 use axum::http::StatusCode;

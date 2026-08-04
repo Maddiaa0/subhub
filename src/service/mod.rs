@@ -268,11 +268,9 @@ pub(crate) fn doctor() -> Result<()> {
     match status {
         Ok(status) => {
             let unavailable = status
-                .get("credentials")
-                .and_then(Value::as_object)
-                .into_iter()
-                .flatten()
-                .filter(|(_, health)| health.get("usage").is_none_or(Value::is_null))
+                .credentials
+                .values()
+                .filter(|report| report.usage.is_none())
                 .count();
             if unavailable == 0 {
                 println!("Doctor:    healthy");
