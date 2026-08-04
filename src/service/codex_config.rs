@@ -1,3 +1,6 @@
+//! Codex config.toml integration: point the Codex CLI at the gateway and
+//! restore the previous provider on uninstall.
+
 use super::{BASE_URL, InstallState, auth_helper_path, write_private_file};
 use crate::{Error, Result};
 use std::env;

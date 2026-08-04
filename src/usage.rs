@@ -1,3 +1,6 @@
+//! Claude subscription usage: snapshot types, eligibility math, and the
+//! usage-endpoint client.
+
 use crate::{Error, Result};
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;

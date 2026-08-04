@@ -1,3 +1,7 @@
+//! Command-line interface: clap argument types, dispatch, and the handlers
+//! for `add`, `list`, `set`, and `audit`. Gateway subcommands delegate to
+//! [`crate::gateway`] and [`crate::service`].
+
 use crate::credentials::index::{
     Index, index_path, legacy_index_path, load_or_migrate_index, save_index, validate_name,
 };

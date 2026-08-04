@@ -1,3 +1,7 @@
+//! The local credential-routing proxy: serves the Anthropic and Codex
+//! surfaces on loopback, audits credential usage in the background, and
+//! refreshes OAuth tokens before they expire.
+
 mod audit;
 pub(crate) mod protocol;
 mod refresh;

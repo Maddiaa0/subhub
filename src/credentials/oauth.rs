@@ -1,3 +1,6 @@
+//! Claude OAuth: token refresh against the provider token endpoint, scope
+//! validation, and oauthAccount metadata handling.
+
 use crate::credentials::gateway_credentials;
 use crate::credentials::index::{index_path, legacy_index_path, load_or_migrate_index};
 use crate::credentials::vault::{
