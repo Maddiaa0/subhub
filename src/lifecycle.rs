@@ -286,9 +286,8 @@ pub(crate) fn status() -> Result<()> {
         }
     );
     if running {
-        match gateway_health() {
-            Ok(Some(selected)) => println!("Gateway:   reachable (using {selected})"),
-            Ok(None) => println!("Gateway:   reachable (auditing credentials)"),
+        match fetch_gateway_status() {
+            Ok(status) => print_gateway_health(&status),
             Err(error) => println!("Gateway:   not reachable ({error})"),
         }
     }
@@ -296,6 +295,42 @@ pub(crate) fn status() -> Result<()> {
         println!("Warning: a shell Anthropic credential may override Subhub's apiKeyHelper.");
     }
     Ok(())
+}
+
+fn print_gateway_health(status: &Value) {
+    println!("Gateway:   reachable");
+    let selected = status.get("selected").and_then(Value::as_object);
+    let credentials = status.get("credentials").and_then(Value::as_object);
+    let Some(credentials) = credentials else {
+        println!("Credentials: auditing");
+        return;
+    };
+    for (name, health) in credentials {
+        let provider = health
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let active = selected
+            .and_then(|selected| selected.get(provider))
+            .and_then(Value::as_str)
+            == Some(name);
+        let token = health
+            .get("token_state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let audit = if health.get("usage").is_some_and(|usage| !usage.is_null()) {
+            "available"
+        } else {
+            "unavailable"
+        };
+        println!(
+            "  {name} [{provider}]{}: token {token}, audit {audit}",
+            if active { " (selected)" } else { "" }
+        );
+        if let Some(error) = health.get("error").and_then(Value::as_str) {
+            println!("    Last error: {error}");
+        }
+    }
 }
 
 pub(crate) fn statusline() -> Result<()> {
@@ -318,24 +353,6 @@ pub(crate) fn statusline() -> Result<()> {
         println!("{previous} | {subhub}");
     }
     Ok(())
-}
-
-fn gateway_health() -> Result<Option<String>> {
-    let body = fetch_gateway_status()?;
-    let mut parts = Vec::new();
-    for provider in ["claude", "codex"] {
-        if let Some(name) = body
-            .pointer(&format!("/selected/{provider}"))
-            .and_then(Value::as_str)
-        {
-            parts.push(format!("{provider}: {name}"));
-        }
-    }
-    Ok(if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(", "))
-    })
 }
 
 fn fetch_gateway_status() -> Result<Value> {
