@@ -33,7 +33,8 @@ To install from a local checkout, run `cargo install --path .`.
 `subhub add` prompts for Claude Code or Codex. Claude accounts are captured
 after the standard `claude auth login --claudeai` flow. Codex accounts are
 captured after a standard `codex login` ChatGPT flow in an isolated temporary
-credential cache. On macOS, tokens are stored in the login Keychain. On Linux,
+credential cache; pass `--device-auth` on remote or headless machines to use
+the device-code flow instead of a local browser. On macOS, tokens are stored in the login Keychain. On Linux,
 they are stored in `$XDG_CONFIG_HOME/subhub/credentials.json` (defaulting to
 `~/.config/subhub/credentials.json`) with user-only permissions. Tokens are
 never written to the Subhub index.
@@ -45,7 +46,9 @@ shared or made group/world-readable.
 ## Commands
 
 ```text
-subhub add <name> [--force]       Save or replace an account
+subhub add <name> [--force] [--device-auth]
+                                  Save or replace an account
+                                  (--device-auth: Codex device-code login)
 subhub list                       List accounts and their providers
 subhub set <name>                 Select an account
 subhub audit [--json]             Show subscription usage
@@ -108,5 +111,10 @@ credentials, its gateway token, and its local index, run:
 subhub gateway uninstall --purge
 ```
 
-OAuth refresh remains delegated to the provider CLIs. Re-add an expired account
-with `subhub add <name> --force`.
+The gateway refreshes Claude OAuth credentials shortly before access-token
+expiry and retries one pre-stream request after refreshing on an upstream 401.
+Rotated access and refresh tokens are persisted back to secure storage. Re-add
+an account with `subhub add <name> --force` only when its refresh token has also
+expired or been revoked. A running gateway is told to reload its credentials
+after every `subhub add`, so new logins are routable immediately without a
+restart.

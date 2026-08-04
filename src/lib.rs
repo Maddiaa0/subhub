@@ -75,6 +75,9 @@ enum Commands {
         /// Replace an existing credential with the same name
         #[arg(long, short)]
         force: bool,
+        /// Use device-code authentication for the Codex login (for remote or headless machines)
+        #[arg(long, short = 'd')]
+        device_auth: bool,
     },
     /// List saved credential names and mark the active one
     List,
@@ -144,7 +147,12 @@ enum GatewayCommands {
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct Index {
     version: u8,
+    /// Most recently activated credential, kept for older subhub binaries.
     active: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_claude: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_codex: Option<String>,
     credentials: Vec<String>,
 }
 
@@ -173,6 +181,7 @@ pub(crate) enum Provider {
 pub(crate) struct StoredCredential {
     pub name: String,
     pub access_token: String,
+    pub expires_at: Option<i64>,
     pub scopes: Vec<String>,
     pub provider: Provider,
     pub account_id: Option<String>,
@@ -183,6 +192,8 @@ impl Index {
         Self {
             version: 1,
             active: None,
+            active_claude: None,
+            active_codex: None,
             credentials: Vec::new(),
         }
     }
@@ -191,12 +202,44 @@ impl Index {
         self.credentials.iter().any(|item| item == name)
     }
 
-    fn add(&mut self, name: &str) {
+    fn add(&mut self, name: &str, provider: Provider) {
         if !self.contains(name) {
             self.credentials.push(name.to_owned());
             self.credentials.sort();
         }
+        self.activate(name, provider);
+    }
+
+    fn activate(&mut self, name: &str, provider: Provider) {
         self.active = Some(name.to_owned());
+        *match provider {
+            Provider::Claude => &mut self.active_claude,
+            Provider::Codex => &mut self.active_codex,
+        } = Some(name.to_owned());
+    }
+
+    /// Active credential for a provider, falling back to the legacy single
+    /// slot for index files written before per-provider tracking.
+    fn active_for(&self, provider: Provider) -> Option<&str> {
+        match provider {
+            Provider::Claude => &self.active_claude,
+            Provider::Codex => &self.active_codex,
+        }
+        .as_deref()
+        .or(self.active.as_deref())
+    }
+
+    fn active_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for name in [&self.active_claude, &self.active_codex, &self.active]
+            .into_iter()
+            .flatten()
+        {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        names
     }
 }
 
@@ -213,7 +256,11 @@ fn dispatch(cli: Cli) -> Result<()> {
     let mut index = load_or_migrate_index(&path, &legacy_index_path()?)?;
 
     match cli.command {
-        Commands::Add { name, force } => add(&path, &mut index, &name, force),
+        Commands::Add {
+            name,
+            force,
+            device_auth,
+        } => add(&path, &mut index, &name, force, device_auth),
         Commands::List => list(&index),
         Commands::Set { name } => set(&path, &mut index, &name),
         Commands::Audit { json } => {
@@ -240,7 +287,7 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
                 reserve_percent,
                 audit_interval,
                 background,
-                initial_selected: index.active.clone(),
+                initial_selected: index.active_names(),
                 credentials,
             }))
         }
@@ -264,7 +311,7 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
         .map_err(|error| AppError(format!("could not start async runtime: {error}")))
 }
 
-fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
+fn add(path: &Path, index: &mut Index, name: &str, force: bool, device_auth: bool) -> Result<()> {
     validate_name(name)?;
     if index.contains(name) && !force {
         return Err(AppError(format!(
@@ -276,7 +323,12 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
     let mut choice = String::new();
     io::stdin().read_line(&mut choice)?;
     if choice.trim() == "2" {
-        return add_codex(path, index, name);
+        return add_codex(path, index, name, device_auth);
+    }
+    if device_auth {
+        return Err(AppError(
+            "--device-auth only applies to Codex logins; choose subscription type 2".into(),
+        ));
     }
     println!("Opening Claude Code login for credential \"{name}\"...");
     let oauth_scopes = requested_oauth_scopes(env::var_os(CLAUDE_OAUTH_SCOPES_ENV).as_deref());
@@ -308,13 +360,26 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool) -> Result<()> {
     })?;
     credential_write(VAULT_SERVICE, name, &vault_entry)?;
 
-    index.add(name);
+    index.add(name, Provider::Claude);
     save_index(path, index)?;
     println!("Saved \"{name}\" and made it active.");
+    notify_gateway_reload();
     Ok(())
 }
 
-fn add_codex(path: &Path, index: &mut Index, name: &str) -> Result<()> {
+/// A running gateway holds an in-memory vault snapshot, so a fresh login is
+/// invisible to it until it reloads.
+fn notify_gateway_reload() {
+    match lifecycle::reload_gateway_accounts() {
+        Ok(true) => println!("Running gateway reloaded credentials."),
+        Ok(false) => {}
+        Err(error) => eprintln!(
+            "warning: running gateway did not reload credentials: {error}; run `subhub gateway restart` to pick up this login"
+        ),
+    }
+}
+
+fn add_codex(path: &Path, index: &mut Index, name: &str, device_auth: bool) -> Result<()> {
     use rand::distr::{Alphanumeric, SampleString};
     let temporary_home = env::temp_dir().join(format!(
         "subhub-codex-login-{}",
@@ -324,8 +389,12 @@ fn add_codex(path: &Path, index: &mut Index, name: &str) -> Result<()> {
     fs::set_permissions(&temporary_home, fs::Permissions::from_mode(0o700))?;
     let auth_path = temporary_home.join("auth.json");
     println!("Opening Codex ChatGPT login for credential \"{name}\"...");
-    let status = Command::new("codex")
-        .args(["-c", "cli_auth_credentials_store=\"file\"", "login"])
+    let mut login = Command::new("codex");
+    login.args(["-c", "cli_auth_credentials_store=\"file\"", "login"]);
+    if device_auth {
+        login.arg("--device-auth");
+    }
+    let status = login
         .env("CODEX_HOME", &temporary_home)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -357,9 +426,10 @@ fn add_codex(path: &Path, index: &mut Index, name: &str) -> Result<()> {
     })();
     fs::remove_dir_all(&temporary_home)?;
     capture?;
-    index.add(name);
+    index.add(name, Provider::Codex);
     save_index(path, index)?;
     println!("Saved Codex subscription \"{name}\".");
+    notify_gateway_reload();
     Ok(())
 }
 
@@ -370,11 +440,6 @@ fn list(index: &Index) -> Result<()> {
     }
 
     for name in &index.credentials {
-        let marker = if index.active.as_deref() == Some(name) {
-            "*"
-        } else {
-            " "
-        };
         let provider = vault_read(name)
             .ok()
             .and_then(|stored| serde_json::from_str::<Value>(&stored).ok())
@@ -385,6 +450,16 @@ fn list(index: &Index) -> Result<()> {
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| "claude".into());
+        let marker = if index.active_for(if provider == "codex" {
+            Provider::Codex
+        } else {
+            Provider::Claude
+        }) == Some(name)
+        {
+            "*"
+        } else {
+            " "
+        };
         println!("{marker} {name} [{provider}]");
     }
     Ok(())
@@ -415,7 +490,7 @@ fn set(path: &Path, index: &mut Index, name: &str) -> Result<()> {
         write_oauth_account(&entry.oauth_account)?;
     }
 
-    index.active = Some(name.to_owned());
+    index.activate(name, entry.provider);
     save_index(path, index)?;
     println!("Active credential set to \"{name}\".");
     match lifecycle::select_gateway_account(name) {
@@ -436,6 +511,13 @@ fn decode_vault_entry(stored: &str) -> Result<(String, Value)> {
         serde_json::to_string(&entry.credential)?,
         entry.oauth_account,
     ))
+}
+
+/// Fresh vault snapshot for the gateway's `/_subhub/reload` endpoint.
+pub(crate) fn gateway_credentials() -> Result<Vec<StoredCredential>> {
+    let path = index_path()?;
+    let index = load_or_migrate_index(&path, &legacy_index_path()?)?;
+    stored_credentials(&index)
 }
 
 fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
@@ -479,6 +561,9 @@ fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
         credentials.push(StoredCredential {
             name: name.clone(),
             access_token: access_token.to_owned(),
+            expires_at: oauth
+                .and_then(|value| value.get("expiresAt"))
+                .and_then(Value::as_i64),
             scopes,
             provider,
             account_id: credential
@@ -488,6 +573,96 @@ fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
         });
     }
     Ok(credentials)
+}
+
+const CLAUDE_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+#[derive(Deserialize)]
+struct ClaudeRefreshResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_in: i64,
+}
+
+pub(crate) async fn refresh_claude_credential(
+    client: &reqwest::Client,
+    name: &str,
+) -> Result<StoredCredential> {
+    let stored = vault_read(name)?;
+    let mut entry: VaultEntry = serde_json::from_str(&stored)?;
+    if entry.provider != Provider::Claude {
+        return Err(AppError(format!(
+            "credential \"{name}\" is not a Claude credential"
+        )));
+    }
+    let oauth = entry
+        .credential
+        .get_mut("claudeAiOauth")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| AppError(format!("credential \"{name}\" has no Claude OAuth data")))?;
+    let refresh_token = oauth
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| AppError(format!("credential \"{name}\" has no refresh token")))?
+        .to_owned();
+    let response = client
+        .post(CLAUDE_TOKEN_URL)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header(
+            "user-agent",
+            format!(
+                "claude-code/{}",
+                claude_version().as_deref().unwrap_or("2.1.0")
+            ),
+        )
+        .json(&serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLAUDE_CLIENT_ID
+        }))
+        .send()
+        .await
+        .map_err(|error| AppError(format!("Claude OAuth refresh request failed: {error}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(AppError(format!(
+            "Claude OAuth refresh returned {status}: {}",
+            body.chars().take(300).collect::<String>()
+        )));
+    }
+    let refreshed: ClaudeRefreshResponse = response
+        .json()
+        .await
+        .map_err(|error| AppError(format!("invalid Claude OAuth refresh response: {error}")))?;
+    if refreshed.access_token.is_empty() || refreshed.expires_in <= 0 {
+        return Err(AppError(
+            "Claude OAuth refresh returned invalid token data".into(),
+        ));
+    }
+    oauth.insert("accessToken".into(), Value::String(refreshed.access_token));
+    if let Some(refresh_token) = refreshed.refresh_token.filter(|token| !token.is_empty()) {
+        oauth.insert("refreshToken".into(), Value::String(refresh_token));
+    }
+    let expires_at = chrono::Utc::now().timestamp_millis() + refreshed.expires_in * 1000;
+    oauth.insert("expiresAt".into(), Value::Number(expires_at.into()));
+
+    let encoded = serde_json::to_string(&entry)?;
+    credential_write(VAULT_SERVICE, name, &encoded)?;
+    let index = load_or_migrate_index(&index_path()?, &legacy_index_path()?)?;
+    if index.active_for(Provider::Claude) == Some(name) {
+        credential_write(
+            ACTIVE_SERVICE,
+            &current_user()?,
+            &serde_json::to_string(&entry.credential)?,
+        )?;
+    }
+    gateway_credentials()?
+        .into_iter()
+        .find(|credential| credential.name == name)
+        .ok_or_else(|| AppError(format!("refreshed credential \"{name}\" disappeared")))
 }
 
 #[derive(Serialize)]
@@ -1048,10 +1223,27 @@ mod tests {
     #[test]
     fn adding_names_is_sorted_and_marks_active() {
         let mut index = Index::new();
-        index.add("work");
-        index.add("personal");
+        index.add("work", Provider::Codex);
+        index.add("personal", Provider::Claude);
         assert_eq!(index.credentials, ["personal", "work"]);
         assert_eq!(index.active.as_deref(), Some("personal"));
+        assert_eq!(index.active_for(Provider::Claude), Some("personal"));
+        assert_eq!(index.active_for(Provider::Codex), Some("work"));
+        assert_eq!(index.active_names(), ["personal", "work"]);
+    }
+
+    #[test]
+    fn legacy_index_active_slot_backs_both_providers() {
+        let index: Index =
+            serde_json::from_value(serde_json::json!({
+                "version": 1,
+                "active": "personal",
+                "credentials": ["personal"]
+            }))
+            .unwrap();
+        assert_eq!(index.active_for(Provider::Claude), Some("personal"));
+        assert_eq!(index.active_for(Provider::Codex), Some("personal"));
+        assert_eq!(index.active_names(), ["personal"]);
     }
 
     #[test]
@@ -1135,7 +1327,7 @@ mod tests {
         let path = directory.join("index.json");
 
         let mut index = Index::new();
-        index.add("personal");
+        index.add("personal", Provider::Claude);
         save_index(&path, &index).unwrap();
 
         let written = fs::read_to_string(&path).unwrap();
@@ -1145,6 +1337,7 @@ mod tests {
             serde_json::json!({
                 "version": 1,
                 "active": "personal",
+                "active_claude": "personal",
                 "credentials": ["personal"]
             })
         );
@@ -1177,7 +1370,7 @@ mod tests {
         let legacy_path = directory.join("legacy").join("index.json");
         let subhub_path = directory.join("subhub").join("index.json");
         let mut legacy = Index::new();
-        legacy.add("personal");
+        legacy.add("personal", Provider::Claude);
         save_index(&legacy_path, &legacy).unwrap();
 
         let migrated = load_or_migrate_index(&subhub_path, &legacy_path).unwrap();
