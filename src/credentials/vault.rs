@@ -1,3 +1,6 @@
+//! Secret storage: the macOS Keychain or a 0600 credential-store file on
+//! Linux. Nothing outside this module touches raw vault payloads.
+
 use crate::provider::Provider;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,6 @@
+//! Codex (ChatGPT) provider specifics: upstream endpoints and usage
+//! snapshots.
+
 use crate::{Error, Result};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};

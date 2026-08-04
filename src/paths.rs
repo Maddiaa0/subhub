@@ -1,3 +1,5 @@
+//! Configuration file locations and atomic, owner-only JSON writes.
+
 use crate::{Error, Result};
 use serde::Serialize;
 use std::env;

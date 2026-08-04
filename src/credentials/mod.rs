@@ -1,3 +1,7 @@
+//! Saved credentials: OS-vault storage ([`vault`]), the name index
+//! ([`index`]), the Claude OAuth refresh protocol ([`oauth`]), and loading
+//! [`StoredCredential`]s for the gateway.
+
 pub(crate) mod index;
 pub(crate) mod oauth;
 pub(crate) mod vault;

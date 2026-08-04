@@ -1,3 +1,7 @@
+//! Usage auditing: periodically fetch each credential's subscription usage
+//! and record health. Audits are advisory; transient failures must not make
+//! a working credential unroutable.
+
 use super::protocol::CredentialUsage;
 use super::refresh::refresh_credential;
 use super::state::{CredentialHealth, ProxyState, now, safe_error};

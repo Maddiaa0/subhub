@@ -1,3 +1,6 @@
+//! The credential name index: which names exist and which is active per
+//! provider. Never stores secrets (test-enforced).
+
 use crate::paths::{config_base_path, save_json_file};
 use crate::provider::Provider;
 use crate::{Error, Result};

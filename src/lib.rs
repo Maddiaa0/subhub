@@ -1,3 +1,16 @@
+//! Subhub routes Claude Code and Codex traffic through saved subscription
+//! credentials via a local gateway.
+//!
+//! Module map:
+//! - [`cli`]: clap definitions and command handlers
+//! - [`credentials`]: vault storage, the name index, and OAuth refresh
+//! - [`gateway`]: the local HTTP proxy (routing, auditing, refresh)
+//! - [`service`]: install/uninstall and background-service management
+//! - [`provider`]: the per-provider behavior seam
+//! - [`error`]: crate-wide typed errors
+//! - [`output`]: terminal rendering shared by CLI commands
+//! - [`observability`]: structured gateway event log
+
 mod cli;
 mod codex;
 mod credentials;

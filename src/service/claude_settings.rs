@@ -1,3 +1,6 @@
+//! Surgical editing of Claude Code's settings.json: install records what it
+//! changed so uninstall restores exactly that and nothing else.
+
 use super::{BASE_URL, InstallState, PreviousValue, auth_helper_path, statusline_helper_path};
 use crate::{Error, Result, save_json_file};
 use serde_json::{Map, Value};
