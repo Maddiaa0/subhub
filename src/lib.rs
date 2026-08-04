@@ -3,10 +3,11 @@ mod codex;
 mod credentials;
 mod error;
 mod gateway;
-mod lifecycle;
 mod observability;
+mod output;
 mod paths;
 mod provider;
+mod service;
 pub mod usage;
 
 pub use error::{Error, Result};

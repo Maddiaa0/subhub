@@ -6,7 +6,7 @@ mod state;
 
 use crate::provider::StoredCredential;
 use crate::usage::UsageClient;
-use crate::{Error, Result, claude_version, lifecycle};
+use crate::{Error, Result, claude_version, service};
 use axum::Router;
 use axum::routing::any;
 use rand::distr::{Alphanumeric, SampleString};
@@ -48,7 +48,7 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
 
     let client_token = match options
         .client_token
-        .or_else(|| lifecycle::read_gateway_token().ok())
+        .or_else(|| service::read_gateway_token().ok())
     {
         Some(token) => token,
         None if options.background => {

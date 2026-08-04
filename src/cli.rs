@@ -11,7 +11,7 @@ use crate::credentials::vault::{
     validate_credential, vault_read,
 };
 use crate::provider::{Provider, provider_name};
-use crate::{Error, Result, codex, gateway, lifecycle, runtime, usage};
+use crate::{Error, Result, codex, gateway, runtime, service, usage};
 use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -188,20 +188,20 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
                 credentials,
             }))
         }
-        GatewayCommands::Install => lifecycle::install(),
-        GatewayCommands::Reinstall => lifecycle::reinstall(),
-        GatewayCommands::Uninstall { purge } => lifecycle::uninstall(purge),
-        GatewayCommands::Start => lifecycle::start(),
-        GatewayCommands::Stop => lifecycle::stop(),
-        GatewayCommands::Restart => lifecycle::restart(),
-        GatewayCommands::Status { provider } => lifecycle::status(provider.map(Into::into)),
-        GatewayCommands::Logs { lines } => lifecycle::logs(lines),
-        GatewayCommands::Doctor => lifecycle::doctor(),
+        GatewayCommands::Install => service::install(),
+        GatewayCommands::Reinstall => service::reinstall(),
+        GatewayCommands::Uninstall { purge } => service::uninstall(purge),
+        GatewayCommands::Start => service::start(),
+        GatewayCommands::Stop => service::stop(),
+        GatewayCommands::Restart => service::restart(),
+        GatewayCommands::Status { provider } => service::status(provider.map(Into::into)),
+        GatewayCommands::Logs { lines } => service::logs(lines),
+        GatewayCommands::Doctor => service::doctor(),
         GatewayCommands::AuthToken => {
-            println!("{}", lifecycle::read_gateway_token()?);
+            println!("{}", service::read_gateway_token()?);
             Ok(())
         }
-        GatewayCommands::Statusline => lifecycle::statusline(),
+        GatewayCommands::Statusline => service::statusline(),
     }
 }
 
@@ -264,7 +264,7 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool, device_auth: boo
 /// A running gateway holds an in-memory vault snapshot, so a fresh login is
 /// invisible to it until it reloads.
 fn notify_gateway_reload() {
-    match lifecycle::reload_gateway_accounts() {
+    match service::reload_gateway_accounts() {
         Ok(true) => println!("Running gateway reloaded credentials."),
         Ok(false) => {}
         Err(error) => eprintln!(
@@ -402,7 +402,7 @@ fn set(
     index.activate(name, entry.provider);
     save_index(path, index)?;
     println!("Active credential set to \"{name}\".");
-    match lifecycle::select_gateway_account(name) {
+    match service::select_gateway_account(name) {
         Ok(true) => println!("Running gateway switched to \"{name}\"."),
         Ok(false) => {}
         Err(error) => eprintln!("warning: running gateway was not switched: {error}"),
