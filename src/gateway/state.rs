@@ -66,16 +66,18 @@ pub(crate) struct ProxyState {
     pub(crate) credentials: Arc<RwLock<Vec<StoredCredential>>>,
     pub(crate) health: Arc<RwLock<HashMap<String, CredentialHealth>>>,
     pub(crate) selected: Arc<Mutex<SelectedAccounts>>,
-    pub(crate) refresh_lock: Arc<Mutex<()>>,
+    pub(crate) refresh_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub(crate) refresh_backoff: Arc<Mutex<HashMap<String, RefreshBackoff>>>,
     pub(crate) client_token: Arc<String>,
     pub(crate) reserve_percent: f64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RefreshBackoff {
     pub(crate) failures: u32,
     pub(crate) retry_at: u64,
+    pub(crate) terminal: bool,
+    pub(crate) message: String,
 }
 
 pub(crate) fn now() -> u64 {
@@ -87,6 +89,27 @@ pub(crate) fn now() -> u64 {
 
 pub(crate) fn safe_error(error: String) -> String {
     error.chars().take(300).collect()
+}
+
+pub(crate) fn persisted_refresh_backoffs(
+    credentials: &[StoredCredential],
+) -> HashMap<String, RefreshBackoff> {
+    credentials
+        .iter()
+        .filter_map(|credential| {
+            credential.refresh_error.as_ref().map(|message| {
+                (
+                    credential.name.clone(),
+                    RefreshBackoff {
+                        failures: 1,
+                        retry_at: u64::MAX,
+                        terminal: true,
+                        message: message.clone(),
+                    },
+                )
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -103,6 +126,7 @@ pub(crate) fn test_state() -> ProxyState {
                 scopes: vec!["user:profile".into()],
                 provider: Provider::Claude,
                 account_id: None,
+                refresh_error: None,
             },
             StoredCredential {
                 name: "ready".into(),
@@ -111,6 +135,7 @@ pub(crate) fn test_state() -> ProxyState {
                 scopes: vec!["user:profile".into()],
                 provider: Provider::Claude,
                 account_id: None,
+                refresh_error: None,
             },
         ])),
         health: Arc::new(RwLock::new(HashMap::from([
@@ -142,7 +167,7 @@ pub(crate) fn test_state() -> ProxyState {
             ),
         ]))),
         selected: Arc::default(),
-        refresh_lock: Arc::default(),
+        refresh_locks: Arc::default(),
         refresh_backoff: Arc::default(),
         client_token: Arc::new("local-secret".into()),
         reserve_percent: 1.0,
@@ -162,5 +187,14 @@ mod tests {
         selected.retain_names(&["kept".to_string()]);
         assert_eq!(selected.claude.as_deref(), Some("kept"));
         assert_eq!(selected.codex, None);
+    }
+
+    #[test]
+    fn persisted_refresh_error_restores_terminal_state() {
+        let mut credential = test_state().credentials.blocking_read()[0].clone();
+        credential.refresh_error = Some("invalid_grant".into());
+        let backoffs = persisted_refresh_backoffs(&[credential]);
+        assert!(backoffs["full"].terminal);
+        assert_eq!(backoffs["full"].message, "invalid_grant");
     }
 }

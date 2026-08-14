@@ -9,10 +9,12 @@ use crate::credentials::oauth::{
     CLAUDE_OAUTH_SCOPES_ENV, claude_version, read_oauth_account, requested_oauth_scopes,
     validate_required_scopes, write_oauth_account,
 };
-use crate::credentials::stored_credentials;
 use crate::credentials::vault::{
     ACTIVE_SERVICE, VAULT_SERVICE, VaultEntry, credential_read, credential_write, current_user,
     validate_credential, vault_read,
+};
+use crate::credentials::{
+    ensure_unique_claude_identity, retire_active_claude_credential, stored_credentials,
 };
 use crate::provider::Provider;
 use crate::{Error, Result, codex, gateway, runtime, service, usage};
@@ -59,7 +61,7 @@ enum Commands {
     },
     /// List saved credential names and mark the active one
     List,
-    /// Make a saved credential active in Claude Code
+    /// Select the gateway's preferred saved credential
     Set {
         /// Friendly name of the saved credential
         name: String,
@@ -181,6 +183,7 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
             audit_interval,
             background,
         } => {
+            retire_active_claude_credential(index)?;
             let credentials = stored_credentials(index)?;
             runtime()?.block_on(gateway::serve(gateway::ServeOptions {
                 listen,
@@ -251,16 +254,33 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool, device_auth: boo
     validate_required_scopes(&credential)?;
     let credential_value: Value = serde_json::from_str(&credential)?;
     let oauth_account = read_oauth_account()?;
-    let vault_entry = serde_json::to_string(&VaultEntry {
+    let vault_entry = VaultEntry {
         provider: Provider::Claude,
         credential: credential_value,
         oauth_account,
-    })?;
-    credential_write(VAULT_SERVICE, name, &vault_entry)?;
+        refresh_error: None,
+    };
+    if let Err(error) = ensure_unique_claude_identity(index, name, &vault_entry) {
+        // Do not leave the just-created refresh family in Claude Code where it
+        // could race the canonical credential already owned by the gateway.
+        let cleanup = crate::credentials::vault::clear_active_claude_oauth();
+        if let Err(cleanup_error) = cleanup {
+            return Err(Error::Message(format!(
+                "{error}; also failed to retire Claude Code's duplicate OAuth token: {cleanup_error}"
+            )));
+        }
+        return Err(error);
+    }
+    credential_write(VAULT_SERVICE, name, &serde_json::to_string(&vault_entry)?)?;
 
     index.add(name, Provider::Claude);
     save_index(path, index)?;
-    println!("Saved \"{name}\" and made it active.");
+    retire_active_claude_credential(index).map_err(|error| {
+        Error::Message(format!(
+            "saved \"{name}\", but could not transfer exclusive token ownership to Subhub: {error}"
+        ))
+    })?;
+    println!("Saved \"{name}\"; the Subhub gateway is now its sole OAuth-token owner.");
     notify_gateway_reload();
     Ok(())
 }
@@ -320,6 +340,7 @@ fn add_codex(path: &Path, index: &mut Index, name: &str, device_auth: bool) -> R
             provider: Provider::Codex,
             credential,
             oauth_account: Value::Null,
+            refresh_error: None,
         })?;
         credential_write(VAULT_SERVICE, name, &entry)
     })();
@@ -390,7 +411,6 @@ fn set(
     if entry.provider == Provider::Claude {
         let credential = serde_json::to_string(&entry.credential)?;
         validate_credential(&credential)?;
-        credential_write(ACTIVE_SERVICE, &current_user()?, &credential)?;
         write_oauth_account(&entry.oauth_account)?;
     }
 

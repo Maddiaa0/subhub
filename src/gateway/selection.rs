@@ -240,6 +240,7 @@ mod tests {
             scopes: Vec::new(),
             provider: Provider::Codex,
             account_id: Some("account-c".into()),
+            refresh_error: None,
         });
         state.health.write().await.insert(
             "codex".into(),
@@ -273,6 +274,7 @@ mod tests {
             scopes: Vec::new(),
             provider: Provider::Codex,
             account_id: Some("account-c".into()),
+            refresh_error: None,
         });
         state.health.write().await.insert(
             "codex".into(),

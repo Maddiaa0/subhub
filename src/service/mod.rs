@@ -11,6 +11,7 @@ pub(crate) use gateway_client::{
     read_gateway_token, reload_gateway_accounts, select_gateway_account,
 };
 
+use crate::credentials::{restore_active_claude_credential, retire_active_claude_credential};
 use crate::output::{print_gateway_health, yes_no};
 use crate::{
     Error, Result, VAULT_SERVICE, credential_delete, credential_write, index_path, load_index,
@@ -78,6 +79,10 @@ pub(crate) fn install() -> Result<()> {
     let state_path = install_state_path()?;
     let mut settings = read_json_object(&settings_path)?;
     ensure_no_conflicting_claude_credentials(&settings)?;
+    let credential_index = load_index(&index_path()?)?;
+    if retire_active_claude_credential(&credential_index)? {
+        println!("Transferred Claude OAuth token ownership to the Subhub gateway.");
+    }
     let mut state = if state_path.exists() {
         read_install_state(&state_path)?
     } else {
@@ -163,6 +168,10 @@ pub(crate) fn uninstall(purge: bool) -> Result<()> {
         })?;
     }
     refresh_background_services()?;
+    let credential_index = load_index(&index_path()?)?;
+    if restore_active_claude_credential(&credential_index)? {
+        println!("Returned the selected Claude credential to Claude Code.");
+    }
     let helper_path = auth_helper_path()?;
     if helper_path.exists() {
         fs::remove_file(&helper_path).map_err(|error| {

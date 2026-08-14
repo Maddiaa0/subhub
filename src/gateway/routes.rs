@@ -3,11 +3,12 @@
 
 use super::audit::audit_all;
 use super::protocol::{CredentialReport, GatewayStatus, SelectedReport, TokenState};
+use super::refresh::REFRESH_MARGIN_MS;
 use super::refresh::refresh_credential;
 use super::selection::{
     mark_failed, routing_error_message, select_credential, set_selected_account,
 };
-use super::state::ProxyState;
+use super::state::{ProxyState, persisted_refresh_backoffs};
 use crate::provider::{Provider, StoredCredential};
 use crate::{Error, Result};
 use axum::body::{Body, Bytes};
@@ -69,7 +70,10 @@ pub(super) async fn reload_accounts(
         .collect();
     // Each lock is taken and released on its own so this can never deadlock
     // with request handlers that hold another of these locks.
+    let refresh_backoff = persisted_refresh_backoffs(&loaded);
     *state.credentials.write().await = loaded;
+    *state.refresh_backoff.lock().await = refresh_backoff;
+    state.refresh_locks.lock().await.clear();
     state
         .health
         .write()
@@ -95,7 +99,7 @@ pub(super) async fn status(State(state): State<ProxyState>, headers: HeaderMap) 
             let credential = stored.iter().find(|credential| credential.name == name);
             let token_state = match credential.and_then(|credential| credential.expires_at) {
                 Some(expires_at) if expires_at <= now => TokenState::Expired,
-                Some(expires_at) if expires_at <= now + 60_000 => TokenState::RefreshDue,
+                Some(expires_at) if expires_at <= now + REFRESH_MARGIN_MS => TokenState::RefreshDue,
                 Some(_) => TokenState::Valid,
                 None => TokenState::Unknown,
             };
@@ -158,17 +162,20 @@ pub(super) async fn proxy(State(state): State<ProxyState>, request: Request) -> 
         }
     };
     match forward(&state, &parts, bytes.clone(), &first).await {
-        Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
+        Ok(mut response) if response.status() == StatusCode::UNAUTHORIZED => {
             if first.provider.supports_refresh()
                 && let Ok(refreshed) =
                     refresh_credential(&state, &first.name, true, Some(&first.access_token)).await
             {
-                return forward(&state, &parts, bytes, &refreshed)
-                    .await
-                    .map(into_axum_response)
-                    .unwrap_or_else(|error| {
-                        error_response(StatusCode::BAD_GATEWAY, &error.to_string())
-                    });
+                match forward(&state, &parts, bytes.clone(), &refreshed).await {
+                    Ok(retried) if retried.status() != StatusCode::UNAUTHORIZED => {
+                        return into_axum_response(retried);
+                    }
+                    Ok(still_unauthorized) => response = still_unauthorized,
+                    Err(error) => {
+                        return error_response(StatusCode::BAD_GATEWAY, &error.to_string());
+                    }
+                }
             }
             mark_failed(&state, &first.name, StatusCode::UNAUTHORIZED).await;
             if let Some(second) =

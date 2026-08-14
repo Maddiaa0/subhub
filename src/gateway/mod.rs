@@ -15,7 +15,7 @@ use crate::{Error, Result, claude_version, service};
 use axum::Router;
 use axum::routing::any;
 use rand::distr::{Alphanumeric, SampleString};
-use state::{ProxyState, SelectedAccounts};
+use state::{ProxyState, SelectedAccounts, persisted_refresh_backoffs};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -80,14 +80,15 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
             }
         }
     }
+    let refresh_backoff = persisted_refresh_backoffs(&options.credentials);
     let state = ProxyState {
         usage_client: UsageClient::new(client.clone(), claude_version().as_deref()),
         client,
         credentials: Arc::new(RwLock::new(options.credentials)),
         health: Arc::default(),
         selected: Arc::new(Mutex::new(initial_selected)),
-        refresh_lock: Arc::default(),
-        refresh_backoff: Arc::default(),
+        refresh_locks: Arc::default(),
+        refresh_backoff: Arc::new(Mutex::new(refresh_backoff)),
         client_token: Arc::new(client_token.clone()),
         reserve_percent: options.reserve_percent,
     };
