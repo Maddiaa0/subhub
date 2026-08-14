@@ -12,10 +12,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// into [`ErrorKind`] so credential health reporting stays accurate.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// An OAuth token refresh failed. The credential likely needs
-    /// re-authentication (`subhub add <name> --force`).
+    /// An OAuth token refresh failed because of a temporary transport or
+    /// provider problem and may be retried after backoff.
     #[error("{0}")]
-    Refresh(String),
+    RefreshTransient(String),
+    /// An OAuth token refresh failed permanently. Retrying a rotating refresh
+    /// token after this point can invalidate a newer token in the same family.
+    #[error("{0}")]
+    RefreshTerminal(String),
     /// A usage audit failed. `transient` distinguishes infrastructure hiccups
     /// (timeouts, rate limits, upstream 5xx) that say nothing about the
     /// credential from failures that mean the credential itself is unusable
@@ -31,6 +35,18 @@ pub enum Error {
 }
 
 impl Error {
+    pub(crate) fn refresh_transient(message: impl Into<String>) -> Self {
+        Self::RefreshTransient(message.into())
+    }
+
+    pub(crate) fn refresh_terminal(message: impl Into<String>) -> Self {
+        Self::RefreshTerminal(message.into())
+    }
+
+    pub(crate) fn refresh_is_terminal(&self) -> bool {
+        matches!(self, Self::RefreshTerminal(_))
+    }
+
     pub(crate) fn audit_transient(message: impl Into<String>) -> Self {
         Self::Audit {
             transient: true,
@@ -47,7 +63,7 @@ impl Error {
 
     pub(crate) fn kind(&self) -> ErrorKind {
         match self {
-            Self::Refresh(_) => ErrorKind::Refresh,
+            Self::RefreshTransient(_) | Self::RefreshTerminal(_) => ErrorKind::Refresh,
             Self::Audit {
                 transient: true, ..
             } => ErrorKind::TransientAudit,
@@ -94,7 +110,10 @@ mod tests {
 
     #[test]
     fn kinds_classify_routing_relevant_errors() {
-        assert_eq!(Error::Refresh("x".into()).kind(), ErrorKind::Refresh);
+        assert_eq!(Error::refresh_transient("x").kind(), ErrorKind::Refresh);
+        assert_eq!(Error::refresh_terminal("x").kind(), ErrorKind::Refresh);
+        assert!(Error::refresh_terminal("x").refresh_is_terminal());
+        assert!(!Error::refresh_transient("x").refresh_is_terminal());
         assert_eq!(
             Error::audit_transient("x").kind(),
             ErrorKind::TransientAudit

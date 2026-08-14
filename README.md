@@ -51,7 +51,7 @@ subhub add <name> [--force] [--device-auth]
                                   (--device-auth: Codex device-code login)
 subhub list                       List accounts and their providers
 subhub set <name> [--provider claude|codex]
-                                  Select an account with provider validation
+                                  Select the gateway's preferred account
 subhub audit [--json]             Show subscription usage
 
 subhub gateway install            Install and start the background gateway
@@ -115,10 +115,21 @@ credentials, its gateway token, and its local index, run:
 subhub gateway uninstall --purge
 ```
 
-The gateway refreshes Claude OAuth credentials shortly before access-token
+The gateway is the sole owner of each Claude refresh-token family. After
+`subhub add` captures a login, it removes Claude Code's independent OAuth-token
+copy; Claude Code authenticates to the local gateway instead. Duplicate Claude
+account identities are rejected so aliases cannot race the same token family.
+Uninstalling the gateway returns the selected credential to Claude Code after
+the gateway has stopped.
+
+The gateway refreshes Claude OAuth credentials five minutes before access-token
 expiry and retries one pre-stream request after refreshing on an upstream 401.
-Rotated access and refresh tokens are persisted back to secure storage. Re-add
-an account with `subhub add <name> --force` only when its refresh token has also
-expired or been revoked. A running gateway is told to reload its credentials
-after every `subhub add`, so new logins are routable immediately without a
-restart.
+Refreshes are single-flighted per credential and protected by a cross-process
+owner lock. Each refresh re-reads the vault after acquiring ownership, and a
+rotated token is persisted before it is published to request handlers. OAuth
+errors such as `invalid_grant` are recorded as terminal and are not retried,
+including after a gateway restart; transport and provider failures use bounded
+backoff. Re-add an account with `subhub add <name> --force` when its refresh
+token has expired or been revoked. A running gateway is told to reload its
+credentials after every `subhub add`, so new logins are routable immediately
+without a restart.

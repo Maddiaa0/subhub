@@ -3,6 +3,7 @@
 //! a working credential unroutable.
 
 use super::protocol::CredentialUsage;
+use super::refresh::REFRESH_MARGIN_MS;
 use super::refresh::refresh_credential;
 use super::state::{CredentialHealth, ProxyState, now, safe_error};
 use crate::codex;
@@ -15,7 +16,7 @@ pub(super) async fn audit_all(state: &ProxyState) {
     for credential in &credentials {
         let credential = if credential.provider.supports_refresh()
             && credential.expires_at.is_some_and(|expires_at| {
-                expires_at <= chrono::Utc::now().timestamp_millis() + 60_000
+                expires_at <= chrono::Utc::now().timestamp_millis() + REFRESH_MARGIN_MS
             }) {
             match refresh_credential(state, &credential.name, false, None).await {
                 Ok(credential) => credential,
@@ -114,7 +115,9 @@ fn audit_health(
             // A usage audit is advisory. In particular, the usage endpoint can
             // rate-limit independently of inference, so a transient audit
             // failure must not make a working credential unroutable.
-            usage: previous_usage,
+            usage: (error.kind() == ErrorKind::TransientAudit)
+                .then_some(previous_usage)
+                .flatten(),
             error: Some(CredentialError::from(&error)),
             checked_at: now(),
         },
@@ -168,5 +171,21 @@ mod tests {
         let error = health.error.unwrap();
         assert_eq!(error.kind, ErrorKind::FatalAudit);
         assert_eq!(error.message, "usage request failed");
+    }
+
+    #[test]
+    fn refresh_failure_discards_stale_usage() {
+        let previous = CredentialUsage::Claude(
+            serde_json::from_value(serde_json::json!({
+                "five_hour": {"utilization": 25.0, "resets_at": null}
+            }))
+            .unwrap(),
+        );
+        let health = audit_health(
+            Some(previous),
+            Err(Error::refresh_terminal("invalid_grant")),
+        );
+        assert!(health.usage.is_none());
+        assert_eq!(health.error.unwrap().kind, ErrorKind::Refresh);
     }
 }

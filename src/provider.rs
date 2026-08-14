@@ -76,6 +76,9 @@ pub(crate) struct StoredCredential {
     pub scopes: Vec<String>,
     pub provider: Provider,
     pub account_id: Option<String>,
+    /// Persisted terminal refresh state. This contains no token material and
+    /// prevents a restarted gateway from reusing a rejected refresh token.
+    pub refresh_error: Option<String>,
 }
 
 #[cfg(test)]

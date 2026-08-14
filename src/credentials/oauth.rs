@@ -1,10 +1,9 @@
 //! Claude OAuth: token refresh against the provider token endpoint, scope
 //! validation, and oauthAccount metadata handling.
 
-use crate::credentials::gateway_credentials;
-use crate::credentials::index::{index_path, legacy_index_path, load_or_migrate_index};
+use crate::credentials::stored_credential_from_entry;
 use crate::credentials::vault::{
-    ACTIVE_SERVICE, VAULT_SERVICE, VaultEntry, credential_write, current_user, vault_read,
+    VaultEntry, acquire_refresh_owner, credential_write_owned, vault_read_owned,
 };
 use crate::paths::{claude_config_path, save_json_file};
 use crate::provider::{Provider, StoredCredential};
@@ -13,6 +12,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
 use std::process::Command;
+use std::time::Duration;
 
 pub(crate) const CLAUDE_OAUTH_SCOPES_ENV: &str = "CLAUDE_CODE_OAUTH_SCOPES";
 pub(crate) const REQUESTED_OAUTH_SCOPES: [&str; 4] = [
@@ -26,63 +26,161 @@ const REQUIRED_OAUTH_SCOPES: [&str; 2] = ["user:inference", "user:profile"];
 const CLAUDE_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ClaudeRefreshResponse {
     access_token: String,
     refresh_token: Option<String>,
     expires_in: i64,
+    #[serde(default)]
+    refresh_token_expires_in: Option<i64>,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 pub(crate) async fn refresh_claude_credential(
     client: &reqwest::Client,
     name: &str,
+    expected_access_token: Option<&str>,
 ) -> Result<StoredCredential> {
-    let stored = vault_read(name)?;
-    let mut entry: VaultEntry = serde_json::from_str(&stored)?;
+    // The lease spans the final read, provider request, and durable write. A
+    // second gateway waits, re-reads, and observes the winner instead of
+    // reusing a rotating refresh token.
+    let lease = tokio::task::spawn_blocking(acquire_refresh_owner)
+        .await
+        .map_err(|error| Error::refresh_transient(format!("OAuth owner lock failed: {error}")))?
+        .map_err(|error| Error::refresh_transient(error.to_string()))?;
+    let stored = vault_read_owned(name, &lease)
+        .map_err(|error| Error::refresh_terminal(error.to_string()))?;
+    let mut entry: VaultEntry = serde_json::from_str(&stored).map_err(|error| {
+        Error::refresh_terminal(format!("credential \"{name}\" is invalid: {error}"))
+    })?;
     if entry.provider != Provider::Claude {
-        return Err(Error::Message(format!(
+        return Err(Error::refresh_terminal(format!(
             "credential \"{name}\" is not a Claude credential"
         )));
     }
+    let current = stored_credential_from_entry(name, &entry)
+        .map_err(|error| Error::refresh_terminal(error.to_string()))?;
+    if expected_access_token.is_some_and(|expected| expected != current.access_token) {
+        return Ok(current);
+    }
     let oauth = entry
         .credential
-        .get_mut("claudeAiOauth")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| Error::Refresh(format!("credential \"{name}\" has no Claude OAuth data")))?;
+        .get("claudeAiOauth")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            Error::refresh_terminal(format!("credential \"{name}\" has no Claude OAuth data"))
+        })?;
     let refresh_token = oauth
         .get("refreshToken")
         .and_then(Value::as_str)
         .filter(|token| !token.is_empty())
-        .ok_or_else(|| Error::Refresh(format!("credential \"{name}\" has no refresh token")))?
+        .ok_or_else(|| {
+            Error::refresh_terminal(format!("credential \"{name}\" has no refresh token"))
+        })?
         .to_owned();
-    let refreshed = request_claude_refresh(client, CLAUDE_TOKEN_URL, &refresh_token).await?;
+    let client_id = oauth
+        .get("clientId")
+        .or_else(|| oauth.get("client_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(CLAUDE_CLIENT_ID)
+        .to_owned();
+    let scopes = oauth
+        .get("scopes")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| REQUESTED_OAUTH_SCOPES.join(" "));
+    let refreshed = match request_claude_refresh(
+        client,
+        CLAUDE_TOKEN_URL,
+        &refresh_token,
+        &client_id,
+        &scopes,
+    )
+    .await
+    {
+        Ok(refreshed) => refreshed,
+        Err(error) if error.refresh_is_terminal() => {
+            entry.refresh_error = Some(error.to_string().chars().take(300).collect());
+            let encoded = serde_json::to_string(&entry)?;
+            credential_write_owned(
+                crate::credentials::vault::VAULT_SERVICE,
+                name,
+                &encoded,
+                &lease,
+            )
+            .map_err(|persist_error| {
+                Error::refresh_terminal(format!(
+                    "{error}; Subhub also could not persist the terminal refresh state: {persist_error}"
+                ))
+            })?;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    entry.refresh_error = None;
+    let oauth = entry
+        .credential
+        .get_mut("claudeAiOauth")
+        .and_then(Value::as_object_mut)
+        .expect("Claude OAuth object was validated above");
     oauth.insert("accessToken".into(), Value::String(refreshed.access_token));
     if let Some(refresh_token) = refreshed.refresh_token.filter(|token| !token.is_empty()) {
         oauth.insert("refreshToken".into(), Value::String(refresh_token));
     }
-    let expires_at = chrono::Utc::now().timestamp_millis() + refreshed.expires_in * 1000;
+    let expires_at = now + refreshed.expires_in * 1000;
     oauth.insert("expiresAt".into(), Value::Number(expires_at.into()));
+    if let Some(expires_in) = refreshed
+        .refresh_token_expires_in
+        .filter(|expires_in| *expires_in > 0)
+    {
+        oauth.insert(
+            "refreshTokenExpiresAt".into(),
+            Value::Number((now + expires_in * 1000).into()),
+        );
+    }
+    if let Some(scopes) = refreshed.scope.filter(|scope| !scope.is_empty()) {
+        oauth.insert(
+            "scopes".into(),
+            Value::Array(
+                scopes
+                    .split_whitespace()
+                    .map(|scope| Value::String(scope.to_owned()))
+                    .collect(),
+            ),
+        );
+    }
 
     let encoded = serde_json::to_string(&entry)?;
-    credential_write(VAULT_SERVICE, name, &encoded)?;
-    let index = load_or_migrate_index(&index_path()?, &legacy_index_path()?)?;
-    if index.active_for(Provider::Claude) == Some(name) {
-        credential_write(
-            ACTIVE_SERVICE,
-            &current_user()?,
-            &serde_json::to_string(&entry.credential)?,
-        )?;
-    }
-    gateway_credentials()?
-        .into_iter()
-        .find(|credential| credential.name == name)
-        .ok_or_else(|| Error::Message(format!("refreshed credential \"{name}\" disappeared")))
+    credential_write_owned(
+        crate::credentials::vault::VAULT_SERVICE,
+        name,
+        &encoded,
+        &lease,
+    )
+    .map_err(|error| {
+        Error::refresh_terminal(format!(
+            "Claude rotated credential \"{name}\", but Subhub could not persist it: {error}; the old refresh token will not be retried"
+        ))
+    })?;
+    stored_credential_from_entry(name, &entry)
 }
 
 async fn request_claude_refresh(
     client: &reqwest::Client,
     token_url: &str,
     refresh_token: &str,
+    client_id: &str,
+    scopes: &str,
 ) -> Result<ClaudeRefreshResponse> {
     let response = client
         .post(token_url)
@@ -97,28 +195,75 @@ async fn request_claude_refresh(
         .json(&serde_json::json!({
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
-            "client_id": CLAUDE_CLIENT_ID
+            "client_id": client_id,
+            "scope": scopes
         }))
+        .timeout(Duration::from_secs(30))
         .send()
         .await
-        .map_err(|error| Error::Refresh(format!("Claude OAuth refresh request failed: {error}")))?;
+        .map_err(|error| {
+            Error::refresh_transient(format!("Claude OAuth refresh request failed: {error}"))
+        })?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(Error::Refresh(format!(
-            "Claude OAuth refresh returned {status}: {}",
+        if let Some(detail) = oauth_error_detail(&body) {
+            return Err(Error::refresh_terminal(format!(
+                "Claude OAuth refresh returned {status}: {}",
+                detail.chars().take(300).collect::<String>()
+            )));
+        }
+        if status.is_client_error()
+            && status != reqwest::StatusCode::REQUEST_TIMEOUT
+            && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            return Err(Error::refresh_terminal(format!(
+                "Claude OAuth refresh returned unrecoverable {status}: {}",
+                body.chars().take(300).collect::<String>()
+            )));
+        }
+        return Err(Error::refresh_transient(format!(
+            "Claude OAuth refresh returned {status} without an OAuth error: {}",
             body.chars().take(300).collect::<String>()
         )));
     }
     let refreshed: ClaudeRefreshResponse = response.json().await.map_err(|error| {
-        Error::Refresh(format!("invalid Claude OAuth refresh response: {error}"))
+        Error::refresh_transient(format!("invalid Claude OAuth refresh response: {error}"))
     })?;
     if refreshed.access_token.is_empty() || refreshed.expires_in <= 0 {
-        return Err(Error::Refresh(
-            "Claude OAuth refresh returned invalid token data".into(),
+        return Err(Error::refresh_transient(
+            "Claude OAuth refresh returned invalid token data",
         ));
     }
     Ok(refreshed)
+}
+
+fn oauth_error_detail(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    if let Some(code) = error.as_str().filter(|code| !code.is_empty()) {
+        let description = value
+            .get("error_description")
+            .and_then(Value::as_str)
+            .filter(|description| !description.is_empty());
+        return Some(description.map_or_else(
+            || code.to_owned(),
+            |description| format!("{code}: {description}"),
+        ));
+    }
+    let error = error.as_object()?;
+    let code = ["type", "code", "error"]
+        .into_iter()
+        .find_map(|key| error.get(key).and_then(Value::as_str))
+        .filter(|code| !code.is_empty())?;
+    let description = ["message", "description", "error_description"]
+        .into_iter()
+        .find_map(|key| error.get(key).and_then(Value::as_str))
+        .filter(|description| !description.is_empty());
+    Some(description.map_or_else(
+        || code.to_owned(),
+        |description| format!("{code}: {description}"),
+    ))
 }
 
 pub(crate) fn claude_version() -> Option<String> {
@@ -217,6 +362,13 @@ mod tests {
     async fn refresh_server(
         response: Value,
     ) -> (String, oneshot::Receiver<(Value, axum::http::HeaderMap)>) {
+        refresh_server_with_status(axum::http::StatusCode::OK, response).await
+    }
+
+    async fn refresh_server_with_status(
+        status: axum::http::StatusCode,
+        response: Value,
+    ) -> (String, oneshot::Receiver<(Value, axum::http::HeaderMap)>) {
         let (sent, received) = oneshot::channel();
         let sent = std::sync::Arc::new(std::sync::Mutex::new(Some(sent)));
         let app = Router::new().route(
@@ -230,7 +382,7 @@ mod tests {
                         if let Some(sent) = sent.lock().unwrap().take() {
                             let _ = sent.send((body, headers));
                         }
-                        Json(response)
+                        (status, Json(response))
                     }
                 }
             }),
@@ -250,18 +402,72 @@ mod tests {
         }))
         .await;
 
-        let refreshed = request_claude_refresh(&reqwest::Client::new(), &url, "old-refresh")
-            .await
-            .unwrap();
+        let refreshed = request_claude_refresh(
+            &reqwest::Client::new(),
+            &url,
+            "old-refresh",
+            "stored-client",
+            "user:inference user:profile",
+        )
+        .await
+        .unwrap();
         let (body, headers) = received.await.unwrap();
 
         assert_eq!(body["grant_type"], "refresh_token");
         assert_eq!(body["refresh_token"], "old-refresh");
-        assert_eq!(body["client_id"], CLAUDE_CLIENT_ID);
+        assert_eq!(body["client_id"], "stored-client");
+        assert_eq!(body["scope"], "user:inference user:profile");
         assert_eq!(headers["anthropic-beta"], "oauth-2025-04-20");
         assert_eq!(refreshed.access_token, "new-access");
         assert_eq!(refreshed.refresh_token.as_deref(), Some("new-refresh"));
         assert_eq!(refreshed.expires_in, 3600);
+    }
+
+    #[tokio::test]
+    async fn oauth_error_is_terminal_but_bodyless_provider_failure_is_retryable() {
+        let (url, _) = refresh_server_with_status(
+            axum::http::StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "refresh token was already used"
+            }),
+        )
+        .await;
+        let error = request_claude_refresh(
+            &reqwest::Client::new(),
+            &url,
+            "old-refresh",
+            CLAUDE_CLIENT_ID,
+            "user:inference",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.refresh_is_terminal());
+        assert!(error.to_string().contains("invalid_grant"));
+
+        assert_eq!(
+            oauth_error_detail(
+                r#"{"type":"error","error":{"type":"invalid_grant","message":"token reused"}}"#
+            )
+            .as_deref(),
+            Some("invalid_grant: token reused")
+        );
+
+        let (url, _) = refresh_server_with_status(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"message": "temporarily unavailable"}),
+        )
+        .await;
+        let error = request_claude_refresh(
+            &reqwest::Client::new(),
+            &url,
+            "old-refresh",
+            CLAUDE_CLIENT_ID,
+            "user:inference",
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.refresh_is_terminal());
     }
 
     #[test]

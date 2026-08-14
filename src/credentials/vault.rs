@@ -3,16 +3,15 @@
 
 use crate::provider::Provider;
 use crate::{Error, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
 use std::env;
-#[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-#[cfg(target_os = "linux")]
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -23,13 +22,19 @@ pub(crate) const ACTIVE_SERVICE: &str = "Claude Code-credentials";
 pub(crate) const VAULT_SERVICE: &str = "subhub-credentials";
 const LEGACY_VAULT_SERVICE: &str = "sub-manager-credentials";
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct VaultEntry {
     #[serde(default = "claude_provider")]
     pub(crate) provider: Provider,
     pub(crate) credential: Value,
     #[serde(rename = "oauthAccount")]
     pub(crate) oauth_account: Value,
+    #[serde(
+        default,
+        rename = "refreshError",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) refresh_error: Option<String>,
 }
 
 fn claude_provider() -> Provider {
@@ -78,6 +83,64 @@ pub(crate) fn vault_read(name: &str) -> Result<String> {
     }
 }
 
+/// Exclusive lease for the refresh-token store. Every vault mutation takes
+/// this lease, while a refresh keeps it from the final pre-request read until
+/// the rotated token has been persisted. This makes the gateway the sole
+/// writer even if two Subhub processes are accidentally started.
+pub(crate) struct RefreshOwnerLease {
+    _file: fs::File,
+}
+
+pub(crate) fn acquire_refresh_owner() -> Result<RefreshOwnerLease> {
+    let file = open_lock_file("refresh-owner.lock")?;
+    file.lock_exclusive()
+        .map_err(|error| Error::Message(format!("could not lock OAuth token store: {error}")))?;
+    Ok(RefreshOwnerLease { _file: file })
+}
+
+/// Read while [`RefreshOwnerLease`] is already held.
+pub(crate) fn vault_read_owned(name: &str, _lease: &RefreshOwnerLease) -> Result<String> {
+    match credential_read(VAULT_SERVICE, name) {
+        Ok(stored) => Ok(stored),
+        Err(current_error) => match credential_read(LEGACY_VAULT_SERVICE, name) {
+            Ok(stored) => {
+                credential_write_owned(VAULT_SERVICE, name, &stored, _lease)?;
+                Ok(stored)
+            }
+            Err(_) => Err(current_error),
+        },
+    }
+}
+
+fn open_lock_file(name: &str) -> Result<fs::File> {
+    let directory = crate::config_base_path()?.join(if cfg!(target_os = "macos") {
+        ".subhub"
+    } else {
+        "subhub"
+    });
+    open_lock_file_in(&directory, name)
+}
+
+fn open_lock_file_in(directory: &Path, name: &str) -> Result<fs::File> {
+    fs::create_dir_all(directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    }
+    let path = directory.join(name);
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options
+        .open(&path)
+        .map_err(|error| Error::Message(format!("could not open {}: {error}", path.display())))
+}
+
 pub(crate) fn current_user() -> Result<String> {
     env::var("USER")
         .ok()
@@ -105,7 +168,89 @@ pub(crate) fn credential_read(service: &str, account: &str) -> Result<String> {
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn active_credential_read() -> Result<Option<String>> {
+    let account = current_user()?;
+    let output = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            ACTIVE_SERVICE,
+            "-a",
+            &account,
+            "-w",
+        ])
+        .output()
+        .map_err(|error| Error::Message(format!("could not run `security`: {error}")))?;
+    if output.status.success() {
+        return String::from_utf8(output.stdout)
+            .map(|value| Some(value.trim_end_matches(['\r', '\n']).to_owned()))
+            .map_err(|_| Error::Message("Keychain returned a non-UTF-8 credential".into()));
+    }
+    if output.status.code() == Some(44) {
+        return Ok(None);
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(Error::Message(if detail.is_empty() {
+        "could not inspect Claude Code credential in Keychain".into()
+    } else {
+        detail
+    }))
+}
+
+/// Remove only Claude's OAuth object from the active Claude Code credential,
+/// preserving any unrelated secrets that share the same JSON container.
+pub(crate) fn clear_active_claude_oauth() -> Result<bool> {
+    let Some(raw) = active_credential_read()? else {
+        return Ok(false);
+    };
+    let mut credential: Value = serde_json::from_str(&raw).map_err(|error| {
+        Error::Message(format!(
+            "Claude Code's active credential is not valid JSON: {error}"
+        ))
+    })?;
+    if !remove_claude_oauth(&mut credential)? {
+        return Ok(false);
+    }
+    let account = current_user()?;
+    if credential
+        .as_object()
+        .is_some_and(serde_json::Map::is_empty)
+    {
+        credential_delete(ACTIVE_SERVICE, &account)?;
+    } else {
+        credential_write(
+            ACTIVE_SERVICE,
+            &account,
+            &serde_json::to_string(&credential)?,
+        )?;
+    }
+    Ok(true)
+}
+
+fn remove_claude_oauth(credential: &mut Value) -> Result<bool> {
+    credential
+        .as_object_mut()
+        .ok_or_else(|| {
+            Error::Message("Claude Code's active credential is not a JSON object".into())
+        })
+        .map(|object| object.remove("claudeAiOauth").is_some())
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn credential_write(service: &str, account: &str, credential: &str) -> Result<()> {
+    let lease = (service == VAULT_SERVICE)
+        .then(acquire_refresh_owner)
+        .transpose()?;
+    credential_write_owned_maybe(service, account, credential, lease.as_ref())
+}
+
+#[cfg(target_os = "macos")]
+fn credential_write_owned_maybe(
+    service: &str,
+    account: &str,
+    credential: &str,
+    _lease: Option<&RefreshOwnerLease>,
+) -> Result<()> {
     let output = Command::new("security")
         .args([
             "add-generic-password",
@@ -129,7 +274,20 @@ pub(crate) fn credential_write(service: &str, account: &str, credential: &str) -
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn credential_write_owned(
+    service: &str,
+    account: &str,
+    credential: &str,
+    lease: &RefreshOwnerLease,
+) -> Result<()> {
+    credential_write_owned_maybe(service, account, credential, Some(lease))
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn credential_delete(service: &str, account: &str) -> Result<()> {
+    let _lease = (service == VAULT_SERVICE)
+        .then(acquire_refresh_owner)
+        .transpose()?;
     let output = Command::new("security")
         .args(["delete-generic-password", "-s", service, "-a", account])
         .output()
@@ -164,10 +322,40 @@ pub(crate) fn credential_read(service: &str, account: &str) -> Result<String> {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn active_credential_read() -> Result<Option<String>> {
+    let path = claude_credentials_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|error| Error::Message(format!("could not read {}: {error}", path.display())))
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn credential_write(service: &str, account: &str, credential: &str) -> Result<()> {
+    let lease = (service == VAULT_SERVICE)
+        .then(acquire_refresh_owner)
+        .transpose()?;
+    credential_write_owned_maybe(service, account, credential, lease.as_ref())
+}
+
+#[cfg(target_os = "linux")]
+fn credential_write_owned_maybe(
+    service: &str,
+    account: &str,
+    credential: &str,
+    _lease: Option<&RefreshOwnerLease>,
+) -> Result<()> {
     if service == ACTIVE_SERVICE {
         return write_private_bytes(&claude_credentials_path()?, credential.as_bytes());
     }
+    let store_lock = open_lock_file("credential-store.lock")?;
+    store_lock.lock_exclusive().map_err(|error| {
+        Error::Message(format!(
+            "could not lock credential store for writing: {error}"
+        ))
+    })?;
     let path = credential_store_path()?;
     let mut store = read_credential_store(&path)?;
     store
@@ -178,7 +366,34 @@ pub(crate) fn credential_write(service: &str, account: &str, credential: &str) -
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn credential_write_owned(
+    service: &str,
+    account: &str,
+    credential: &str,
+    lease: &RefreshOwnerLease,
+) -> Result<()> {
+    credential_write_owned_maybe(service, account, credential, Some(lease))
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn credential_delete(service: &str, account: &str) -> Result<()> {
+    if service == ACTIVE_SERVICE {
+        let path = claude_credentials_path()?;
+        return if path.exists() {
+            fs::remove_file(&path).map_err(Into::into)
+        } else {
+            Err(Error::Message("credential was not found".into()))
+        };
+    }
+    let _lease = (service == VAULT_SERVICE)
+        .then(acquire_refresh_owner)
+        .transpose()?;
+    let store_lock = open_lock_file("credential-store.lock")?;
+    store_lock.lock_exclusive().map_err(|error| {
+        Error::Message(format!(
+            "could not lock credential store for writing: {error}"
+        ))
+    })?;
     let path = credential_store_path()?;
     let mut store = read_credential_store(&path)?;
     let removed = store
@@ -270,11 +485,23 @@ mod tests {
                 "claudeAiOauth": {"accessToken": "a", "refreshToken": "r"}
             }),
             oauth_account: serde_json::json!({"emailAddress": "person@example.com"}),
+            refresh_error: None,
         };
         let stored = serde_json::to_string(&entry).unwrap();
         let (credential, account) = decode_vault_entry(&stored).unwrap();
         assert!(validate_credential(&credential).is_ok());
         assert_eq!(account["emailAddress"], "person@example.com");
+    }
+
+    #[test]
+    fn retiring_claude_oauth_preserves_unrelated_active_secrets() {
+        let mut active = serde_json::json!({
+            "claudeAiOauth": {"accessToken": "a", "refreshToken": "r"},
+            "mcpOauth": {"example": "keep-me"}
+        });
+        assert!(remove_claude_oauth(&mut active).unwrap());
+        assert!(active.get("claudeAiOauth").is_none());
+        assert_eq!(active["mcpOauth"]["example"], "keep-me");
     }
 
     #[test]
@@ -317,6 +544,30 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refresh_owner_lock_is_exclusive_across_file_handles() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!(
+            "subhub-owner-lock-test-{}-{unique}",
+            std::process::id()
+        ));
+        let first = open_lock_file_in(&directory, "owner.lock").unwrap();
+        let second = open_lock_file_in(&directory, "owner.lock").unwrap();
+
+        first.lock_exclusive().unwrap();
+        assert!(second.try_lock_exclusive().is_err());
+        drop(first);
+        second.try_lock_exclusive().unwrap();
+
+        drop(second);
         fs::remove_dir_all(directory).unwrap();
     }
 }

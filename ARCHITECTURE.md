@@ -14,8 +14,9 @@ gateway serve ─► StoredCredential snapshot       credentials/mod.rs
                  │
                  ├─ audit loop: fetch usage per credential, record
                  │  CredentialHealth (advisory on transient failure)          gateway/audit.rs
-                 ├─ refresh loop: refresh Claude tokens due within 60s,
-                 │  exponential backoff per credential                        gateway/refresh.rs
+                 ├─ refresh loop: refresh Claude tokens due within 5m,
+                 │  one owner + per-credential singleflight; terminal OAuth
+                 │  errors are persisted, transient failures back off          gateway/refresh.rs
                  ▼
 request ───────► select_credential: sticky choice → least-utilized
                  eligible → transient-audit fallback                          gateway/selection.rs
@@ -50,6 +51,10 @@ The CLI's `gateway status` / `doctor` / `statusline` read the gateway's
 
 - **Secrets stay in the vault.** The index, logs, generated helpers, and
   service files never contain tokens (test-enforced).
+- **One refresh owner.** Claude Code never retains a second OAuth-token copy
+  after capture. The gateway holds a cross-process owner lease from its final
+  vault read through atomic persistence of the rotated token; duplicate Claude
+  account identities are rejected.
 - **Loopback only.** The gateway refuses non-loopback listen addresses; admin
   endpoints require the local bearer token.
 - **Audits are advisory.** A transient audit failure must not make a working
