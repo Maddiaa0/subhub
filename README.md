@@ -201,8 +201,10 @@ If the service needs to be rebuilt, run:
 subhub gateway reinstall
 ```
 
-This preserves saved subscriptions. To remove the integration and all Subhub
-credentials, its gateway token, and its local index, run:
+This preserves saved subscriptions and the currently installed transport. Pass
+an explicit `--transport direct|iron` only when switching modes. To remove the
+integration and all Subhub credentials, its gateway token, and its local index,
+run:
 
 ```sh
 subhub gateway uninstall --purge

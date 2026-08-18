@@ -259,9 +259,25 @@ pub(crate) fn uninstall(purge: bool) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn reinstall(transport: GatewayTransport) -> Result<()> {
+pub(crate) fn reinstall(transport: Option<GatewayTransport>) -> Result<()> {
+    let transport = reinstall_transport(transport, &install_state_path()?)?;
     uninstall(false)?;
     install(transport)
+}
+
+fn reinstall_transport(
+    requested: Option<GatewayTransport>,
+    state_path: &Path,
+) -> Result<GatewayTransport> {
+    if let Some(transport) = requested {
+        return Ok(transport);
+    }
+    if !state_path.exists() {
+        return Err(Error::Message(
+            "Subhub is not installed; run `subhub gateway install`".into(),
+        ));
+    }
+    Ok(read_install_state(state_path)?.transport)
 }
 
 pub(crate) fn start() -> Result<()> {
@@ -778,5 +794,52 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(state.transport, GatewayTransport::Direct);
+    }
+
+    #[test]
+    fn reinstall_preserves_transport_unless_explicitly_overridden() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!(
+            "subhub-reinstall-test-{}-{unique}",
+            std::process::id()
+        ));
+        let path = directory.join("install.json");
+        let mut state = InstallState {
+            version: 2,
+            binary_path: "/usr/local/bin/subhub".into(),
+            transport: GatewayTransport::Direct,
+            previous_base_url: PreviousValue {
+                present: false,
+                value: None,
+            },
+            previous_api_key_helper: PreviousValue {
+                present: false,
+                value: None,
+            },
+            previous_status_line: None,
+            previous_codex_config: None,
+        };
+        save_json_file(&path, &state).unwrap();
+        assert_eq!(
+            reinstall_transport(None, &path).unwrap(),
+            GatewayTransport::Direct
+        );
+
+        state.transport = GatewayTransport::Iron;
+        save_json_file(&path, &state).unwrap();
+        assert_eq!(
+            reinstall_transport(None, &path).unwrap(),
+            GatewayTransport::Iron
+        );
+        assert_eq!(
+            reinstall_transport(Some(GatewayTransport::Direct), &path).unwrap(),
+            GatewayTransport::Direct
+        );
+
+        fs::remove_dir_all(&directory).unwrap();
+        assert!(reinstall_transport(None, &path).is_err());
     }
 }

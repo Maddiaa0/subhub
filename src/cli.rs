@@ -129,9 +129,9 @@ enum GatewayCommands {
     },
     /// Run uninstall then install in a single command, preserving saved credentials
     Reinstall {
-        /// Request transport to configure for Claude Code and Codex
-        #[arg(long, value_enum, default_value = "direct")]
-        transport: GatewayTransportArg,
+        /// Override the installed request transport
+        #[arg(long, value_enum)]
+        transport: Option<GatewayTransportArg>,
     },
     /// Stop the gateway and remove its Claude integration
     Uninstall {
@@ -264,7 +264,9 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
             }))
         }
         GatewayCommands::Install { transport } => service::install(transport.into()),
-        GatewayCommands::Reinstall { transport } => service::reinstall(transport.into()),
+        GatewayCommands::Reinstall { transport } => {
+            service::reinstall(transport.map(gateway::GatewayTransport::from))
+        }
         GatewayCommands::Uninstall { purge } => service::uninstall(purge),
         GatewayCommands::Start => service::start(),
         GatewayCommands::Stop => service::stop(),
@@ -737,6 +739,28 @@ mod tests {
             Cli::try_parse_from(["subhub", "add", "personal", "--capture", "--device-auth"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn reinstall_transport_is_an_optional_override() {
+        let cli = Cli::try_parse_from(["subhub", "gateway", "reinstall"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Gateway {
+                command: GatewayCommands::Reinstall { transport: None }
+            }
+        ));
+
+        let cli =
+            Cli::try_parse_from(["subhub", "gateway", "reinstall", "--transport", "iron"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Gateway {
+                command: GatewayCommands::Reinstall {
+                    transport: Some(GatewayTransportArg::Iron)
+                }
+            }
+        ));
     }
 
     #[test]
