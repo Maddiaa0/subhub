@@ -16,8 +16,8 @@ that still has capacity.
 
 ## Getting started
 
-Subhub requires macOS or Linux, Rust 1.85 or newer, and the `claude` and `codex` CLIs
-for their respective providers.
+Subhub requires macOS or Linux, Rust nightly 1.98 (`nightly-2026-06-21`) or a newer
+nightly, and the `claude` and `codex` CLIs for their respective providers.
 
 ```sh
 cargo install subhub
