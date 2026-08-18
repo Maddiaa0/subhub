@@ -134,6 +134,17 @@ subhub gateway serve --transport iron
 subhub gateway iron-config > subhub-iron-fragment.yaml
 ```
 
+CI can exercise the pinned release end to end in a disposable Kind cluster:
+
+```sh
+./scripts/ci/iron-kind-smoke.sh
+```
+
+The smoke test uses only synthetic credentials and a hermetic fake provider. It
+verifies that Iron accepts the generated configuration, authenticates to
+Subhub's transform service with mTLS, replaces the sandbox credential headers,
+and preserves the inference request through the proxy.
+
 The default local layout is:
 
 ```text

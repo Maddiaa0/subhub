@@ -1,0 +1,111 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iron-kind-smoke
+spec:
+  activeDeadlineSeconds: 240
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      hostAliases:
+        - ip: "127.0.0.1"
+          hostnames:
+            - "chatgpt.com"
+      volumes:
+        - name: smoke
+          emptyDir: {}
+      initContainers:
+        - name: setup
+          image: subhub-iron-smoke:local
+          imagePullPolicy: Never
+          command: ["/usr/local/libexec/subhub-iron-smoke/setup.sh"]
+          env:
+            - name: XDG_CONFIG_HOME
+              value: /smoke/config
+          volumeMounts:
+            - name: smoke
+              mountPath: /smoke
+        - name: fake-provider
+          image: subhub-iron-smoke:local
+          imagePullPolicy: Never
+          restartPolicy: Always
+          command: ["python3", "/usr/local/libexec/subhub-iron-smoke/upstream.py"]
+          volumeMounts:
+            - name: smoke
+              mountPath: /smoke
+        - name: subhub
+          image: subhub-iron-smoke:local
+          imagePullPolicy: Never
+          restartPolicy: Always
+          command:
+            - subhub
+            - gateway
+            - serve
+            - --transport
+            - iron
+            - --audit-interval
+            - "30"
+          env:
+            - name: XDG_CONFIG_HOME
+              value: /smoke/config
+          volumeMounts:
+            - name: smoke
+              mountPath: /smoke
+        - name: iron
+          # smoke.sh pins this local tag to Iron 0.50.0-rc.3's platform digest.
+          image: ironsh/iron-proxy:subhub-smoke
+          imagePullPolicy: Never
+          restartPolicy: Always
+          args: ["-config", "/smoke/iron.yaml"]
+          env:
+            - name: SSL_CERT_FILE
+              value: /smoke/upstream.crt
+          volumeMounts:
+            - name: smoke
+              mountPath: /smoke
+      containers:
+        - name: probe
+          image: subhub-iron-smoke:local
+          imagePullPolicy: Never
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              response_file=/tmp/response.json
+              attempts=0
+              until curl --fail --silent --show-error \
+                --proxy http://127.0.0.1:8080 \
+                --cacert /smoke/iron-ca.crt \
+                --header 'authorization: Bearer inert-sandbox-token' \
+                --header 'chatgpt-account-id: inert-sandbox-account' \
+                --header 'content-type: application/json' \
+                --data '{"model":"smoke-model","input":"subhub-iron-smoke"}' \
+                --output "$response_file" \
+                https://chatgpt.com/backend-api/codex/responses; do
+                attempts=$((attempts + 1))
+                if [ "$attempts" -ge 45 ]; then
+                  echo "proxy request did not succeed after $attempts attempts" >&2
+                  exit 1
+                fi
+                sleep 1
+              done
+              grep -q '"ok": true' "$response_file"
+              grep -q '"source": "subhub-iron-smoke"' "$response_file"
+
+              attempts=0
+              until grep -q '"event":"iron_request_completed"' \
+                /smoke/config/subhub/gateway.jsonl 2>/dev/null; do
+                attempts=$((attempts + 1))
+                if [ "$attempts" -ge 10 ]; then
+                  echo "Subhub did not record Iron request completion" >&2
+                  exit 1
+                fi
+                sleep 1
+              done
+              grep -q '"event":"iron_request_authorized"' \
+                /smoke/config/subhub/gateway.jsonl
+              echo "pinned Iron config, mTLS transform, and credential injection verified"
+          volumeMounts:
+            - name: smoke
+              mountPath: /smoke

@@ -1,0 +1,9 @@
+**
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!rust-toolchain.toml
+!src/**
+!proto/**
+!scripts/ci/iron-kind/setup.sh
+!scripts/ci/iron-kind/upstream.py
