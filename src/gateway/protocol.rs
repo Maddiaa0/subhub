@@ -3,6 +3,7 @@
 //! Changing a field here changes the endpoint's JSON shape — the compiler
 //! keeps both sides in sync.
 
+use super::GatewayTransport;
 use crate::codex;
 use crate::error::CredentialError;
 use crate::provider::Provider;
@@ -12,6 +13,10 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub(crate) struct GatewayStatus {
+    #[serde(default)]
+    pub transport: GatewayTransport,
+    #[serde(default)]
+    pub outstanding_iron_attempts: usize,
     #[serde(default)]
     pub selected: SelectedReport,
     #[serde(default)]

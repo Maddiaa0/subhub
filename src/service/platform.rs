@@ -2,6 +2,7 @@
 //! on Linux. Everything platform-specific about running the gateway as a
 //! daemon lives here.
 
+use crate::gateway::GatewayTransport;
 use crate::{Error, Result};
 use std::env;
 #[cfg(target_os = "macos")]
@@ -36,12 +37,21 @@ pub(super) fn background_service_path() -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn write_background_service(path: &Path, binary: &Path) -> Result<()> {
+pub(super) fn write_background_service(
+    path: &Path,
+    binary: &Path,
+    transport: GatewayTransport,
+) -> Result<()> {
     let binary = xml_escape(
         binary
             .to_str()
             .ok_or_else(|| Error::Message("Subhub executable path is not UTF-8".into()))?,
     );
+    let transport_arguments = if transport == GatewayTransport::Iron {
+        "\n    <string>--transport</string>\n    <string>iron</string>"
+    } else {
+        ""
+    };
     let contents = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -54,7 +64,7 @@ pub(super) fn write_background_service(path: &Path, binary: &Path) -> Result<()>
     <string>{binary}</string>
     <string>gateway</string>
     <string>serve</string>
-    <string>--background</string>
+    <string>--background</string>{transport_arguments}
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -77,10 +87,19 @@ pub(super) fn write_background_service(path: &Path, binary: &Path) -> Result<()>
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn write_background_service(path: &Path, binary: &Path) -> Result<()> {
+pub(super) fn write_background_service(
+    path: &Path,
+    binary: &Path,
+    transport: GatewayTransport,
+) -> Result<()> {
     let executable = systemd_quote(binary)?;
+    let transport_argument = if transport == GatewayTransport::Iron {
+        " --transport iron"
+    } else {
+        ""
+    };
     let contents = format!(
-        "[Unit]\nDescription=Subhub credential-routing gateway\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={executable} gateway serve --background\nRestart=on-failure\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n"
+        "[Unit]\nDescription=Subhub credential-routing gateway\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={executable} gateway serve --background{transport_argument}\nRestart=on-failure\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n"
     );
     super::write_private_file(path, contents.as_bytes())
 }

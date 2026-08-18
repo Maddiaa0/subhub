@@ -2,6 +2,7 @@
 //! restore the previous provider on uninstall.
 
 use super::{BASE_URL, InstallState, auth_helper_path, write_private_file};
+use crate::gateway::GatewayTransport;
 use crate::{Error, Result};
 use std::env;
 use std::fs;
@@ -26,7 +27,7 @@ pub(super) fn read_codex_config() -> Result<String> {
     }
 }
 
-pub(super) fn install_codex_config() -> Result<()> {
+pub(super) fn install_codex_config(transport: GatewayTransport) -> Result<()> {
     let path = codex_config_path()?;
     let mut document = read_codex_config()?
         .parse::<DocumentMut>()
@@ -34,7 +35,10 @@ pub(super) fn install_codex_config() -> Result<()> {
     document["model_provider"] = value("subhub");
     let mut provider = Table::new();
     provider["name"] = value("Subhub");
-    provider["base_url"] = value(format!("{BASE_URL}/openai"));
+    provider["base_url"] = value(match transport {
+        GatewayTransport::Direct => format!("{BASE_URL}/openai"),
+        GatewayTransport::Iron => crate::codex::RESPONSES_UPSTREAM.into(),
+    });
     provider["wire_api"] = value("responses");
     let mut auth = Table::new();
     auth["command"] = value(auth_helper_path()?.to_string_lossy().into_owned());
@@ -58,8 +62,11 @@ pub(super) fn restore_codex_config(state: &InstallState) -> Result<()> {
     if current["model_provider"].as_str() == Some("subhub") {
         current["model_provider"] = prior.get("model_provider").cloned().unwrap_or(Item::None);
     }
-    if current["model_providers"]["subhub"]["base_url"].as_str()
-        == Some(&format!("{BASE_URL}/openai"))
+    let managed_base_url = match state.transport {
+        GatewayTransport::Direct => format!("{BASE_URL}/openai"),
+        GatewayTransport::Iron => state.managed_codex_base_url().into(),
+    };
+    if current["model_providers"]["subhub"]["base_url"].as_str() == Some(managed_base_url.as_str())
     {
         current["model_providers"]["subhub"] = prior
             .get("model_providers")

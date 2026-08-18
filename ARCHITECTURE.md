@@ -21,9 +21,11 @@ gateway serve ─► StoredCredential snapshot       credentials/mod.rs
 request ───────► select_credential: sticky choice → least-utilized
                  eligible → transient-audit fallback                          gateway/selection.rs
                  │
-                 ▼
-forward ───────► provider upstream (path rewrite, beta headers),
-                 401/429 → mark failed, retry with another credential         gateway/routes.rs
+                 ├─ direct: Subhub forwards to the provider and handles
+                 │  a bounded pre-stream retry                                gateway/routes.rs
+                 │
+                 └─ iron: external TransformService returns credential
+                    headers; Iron forwards and owns the exact replay           gateway/iron/
 ```
 
 The CLI's `gateway status` / `doctor` / `statusline` read the gateway's
@@ -41,7 +43,10 @@ The CLI's `gateway status` / `doctor` / `statusline` read the gateway's
 | `credentials/vault` | OS secret storage; only this module touches raw vault payloads |
 | `credentials/index` | credential names + active slots; never stores secrets |
 | `credentials/oauth` | Claude OAuth refresh protocol, scopes, oauthAccount I/O |
-| `gateway` | the loopback proxy: state, routes, selection, refresh, audit, protocol |
+| `gateway` | transport-neutral state, selection, refresh, audit, and protocol |
+| `gateway/routes` | direct HTTP forwarding plus authenticated admin routes |
+| `gateway/routing` | credential selection and header policy shared by both transports |
+| `gateway/iron` | pinned gRPC transform protocol, attempt correlation, and retry callbacks |
 | `service` | install/uninstall, LaunchAgent/systemd management, admin-endpoint client |
 | `output` | terminal rendering (health listings, status-line segment) |
 | `observability` | append-only JSONL event log for `gateway logs` |
@@ -56,7 +61,16 @@ The CLI's `gateway status` / `doctor` / `statusline` read the gateway's
   vault read through atomic persistence of the rotated token; duplicate Claude
   account identities are rejected.
 - **Loopback only.** The gateway refuses non-loopback listen addresses; admin
-  endpoints require the local bearer token.
+  endpoints require the local bearer token, and Iron retry callbacks require a
+  different dedicated token.
+- **Iron cannot redirect.** The external transform issues credentials only for
+  the exact Anthropic and Codex inference host/method/path combinations. Retry
+  authorization must match the original trace, sandbox, scheme, authority,
+  method, and path/query, and is single-use.
+- **The sandbox never receives provider tokens in Iron mode.** Client helpers
+  return an inert placeholder; the transform injects real credentials only at
+  Iron's upstream boundary. Attempt state and logs contain credential names,
+  never token values.
 - **Audits are advisory.** A transient audit failure must not make a working
   credential unroutable; fatal audit errors must (see `ErrorKind`).
 - **Install is surgical.** `service` records exactly what it changed in
@@ -74,6 +88,7 @@ the exhaustive matches (`provider.rs` first, then the usage-fetch dispatch in
 ## Testing
 
 `cargo test` — unit tests live next to their subjects; protocol-level tests
-(OAuth refresh wire format, status endpoint shape) run against local axum
-servers or serde round-trips. Live testing on a dev machine:
+(OAuth refresh wire format, status endpoint shape, Iron transform mutation,
+and response-retry authorization) run against local services or serde
+round-trips. Live testing on a dev machine:
 `cargo install --path . && subhub gateway restart`, then `subhub gateway status`.

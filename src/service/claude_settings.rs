@@ -1,7 +1,7 @@
 //! Surgical editing of Claude Code's settings.json: install records what it
 //! changed so uninstall restores exactly that and nothing else.
 
-use super::{BASE_URL, InstallState, PreviousValue, auth_helper_path, statusline_helper_path};
+use super::{InstallState, PreviousValue, auth_helper_path, statusline_helper_path};
 use crate::{Error, Result, save_json_file};
 use serde_json::{Map, Value};
 use std::env;
@@ -25,7 +25,7 @@ pub(super) fn restore_claude_settings(state: &InstallState) -> Result<()> {
     restore_nested_if_managed(
         &mut settings,
         &["env", "ANTHROPIC_BASE_URL"],
-        &Value::String(BASE_URL.into()),
+        &Value::String(state.managed_claude_base_url().into()),
         &state.previous_base_url,
     );
     restore_nested_if_managed(
@@ -199,7 +199,7 @@ mod tests {
         set_nested(
             &mut settings,
             &["env", "ANTHROPIC_BASE_URL"],
-            Value::String(BASE_URL.into()),
+            Value::String(crate::service::BASE_URL.into()),
         )
         .unwrap();
         set_nested(
@@ -217,7 +217,7 @@ mod tests {
         restore_nested_if_managed(
             &mut settings,
             &["env", "ANTHROPIC_BASE_URL"],
-            &Value::String(BASE_URL.into()),
+            &Value::String(crate::service::BASE_URL.into()),
             &previous_base,
         );
         restore_nested_if_managed(
@@ -251,7 +251,7 @@ mod tests {
         restore_nested_if_managed(
             &mut settings,
             &["env", "ANTHROPIC_BASE_URL"],
-            &Value::String(BASE_URL.into()),
+            &Value::String(crate::service::BASE_URL.into()),
             &previous,
         );
         assert_eq!(

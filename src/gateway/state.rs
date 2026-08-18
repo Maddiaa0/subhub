@@ -1,5 +1,7 @@
 //! Shared gateway state and small helpers used across gateway submodules.
 
+use super::GatewayTransport;
+use super::iron::AttemptStore;
 use super::protocol::CredentialUsage;
 use crate::error::CredentialError;
 use crate::provider::{Provider, StoredCredential};
@@ -70,6 +72,10 @@ pub(crate) struct ProxyState {
     pub(crate) refresh_backoff: Arc<Mutex<HashMap<String, RefreshBackoff>>>,
     pub(crate) client_token: Arc<String>,
     pub(crate) reserve_percent: f64,
+    pub(crate) transport: GatewayTransport,
+    pub(crate) iron_attempts: Arc<Mutex<AttemptStore>>,
+    pub(crate) iron_retry_token: Arc<String>,
+    pub(crate) iron_sandbox_id: Arc<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +177,10 @@ pub(crate) fn test_state() -> ProxyState {
         refresh_backoff: Arc::default(),
         client_token: Arc::new("local-secret".into()),
         reserve_percent: 1.0,
+        transport: GatewayTransport::Direct,
+        iron_attempts: Arc::default(),
+        iron_retry_token: Arc::new("iron-retry-secret".into()),
+        iron_sandbox_id: Arc::new("local-user".into()),
     }
 }
 

@@ -3,9 +3,11 @@
 //! refreshes OAuth tokens before they expire.
 
 mod audit;
+mod iron;
 pub(crate) mod protocol;
 mod refresh;
 mod routes;
+mod routing;
 mod selection;
 mod state;
 
@@ -15,10 +17,29 @@ use crate::{Error, Result, claude_version, service};
 use axum::Router;
 use axum::routing::any;
 use rand::distr::{Alphanumeric, SampleString};
+use serde::{Deserialize, Serialize};
 use state::{ProxyState, SelectedAccounts, persisted_refresh_backoffs};
+use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum GatewayTransport {
+    #[default]
+    Direct,
+    Iron,
+}
+
+impl GatewayTransport {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Iron => "iron",
+        }
+    }
+}
 
 pub(crate) struct ServeOptions {
     pub listen: String,
@@ -26,6 +47,10 @@ pub(crate) struct ServeOptions {
     pub reserve_percent: f64,
     pub audit_interval: u64,
     pub background: bool,
+    pub transport: GatewayTransport,
+    pub iron_grpc_listen: String,
+    pub iron_retry_token: Option<String>,
+    pub iron_sandbox_id: String,
     pub initial_selected: Vec<String>,
     pub credentials: Vec<StoredCredential>,
 }
@@ -50,6 +75,26 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
             "refusing non-loopback listen address; the MVP is local-only".into(),
         ));
     }
+    let iron_grpc_address = if options.transport == GatewayTransport::Iron {
+        let grpc_address: std::net::SocketAddr =
+            options.iron_grpc_listen.parse().map_err(|error| {
+                Error::Message(format!("invalid Iron gRPC listen address: {error}"))
+            })?;
+        if !grpc_address.ip().is_loopback() {
+            return Err(Error::Message(
+                "refusing non-loopback Iron gRPC listen address; local mode is loopback-only"
+                    .into(),
+            ));
+        }
+        if grpc_address == address {
+            return Err(Error::Message(
+                "Iron gRPC and gateway HTTP listeners must use different addresses".into(),
+            ));
+        }
+        Some(grpc_address)
+    } else {
+        None
+    };
 
     let client_token = match options
         .client_token
@@ -81,6 +126,21 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         }
     }
     let refresh_backoff = persisted_refresh_backoffs(&options.credentials);
+    let iron_retry_token = if options.transport == GatewayTransport::Iron {
+        let token = options
+            .iron_retry_token
+            .or_else(|| service::read_iron_retry_token().ok())
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                Error::Message(
+                    "Iron retry token is missing; run `subhub gateway install --transport iron` or set SUBHUB_IRON_RETRY_TOKEN"
+                        .into(),
+                )
+            })?;
+        Arc::new(token)
+    } else {
+        Arc::default()
+    };
     let state = ProxyState {
         usage_client: UsageClient::new(client.clone(), claude_version().as_deref()),
         client,
@@ -91,6 +151,10 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         refresh_backoff: Arc::new(Mutex::new(refresh_backoff)),
         client_token: Arc::new(client_token.clone()),
         reserve_percent: options.reserve_percent,
+        transport: options.transport,
+        iron_attempts: Arc::default(),
+        iron_retry_token,
+        iron_sandbox_id: Arc::new(options.iron_sandbox_id),
     };
     let audit_state = state.clone();
     let interval = options.audit_interval.max(30);
@@ -119,23 +183,100 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         .route(
             "/_subhub/reload",
             axum::routing::post(routes::reload_accounts),
-        )
-        .route("/{*path}", any(routes::proxy))
-        .with_state(state);
+        );
+    let app = match options.transport {
+        GatewayTransport::Direct => app.route("/{*path}", any(routes::proxy)),
+        GatewayTransport::Iron => app
+            .route(
+                "/_subhub/iron/retry/authorize",
+                axum::routing::post(iron::retry::authorize),
+            )
+            .route(
+                "/_subhub/iron/retry/complete",
+                axum::routing::post(iron::retry::complete),
+            ),
+    }
+    .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .map_err(|error| Error::Message(format!("could not listen on {address}: {error}")))?;
 
     if !options.background {
-        println!("subhub proxy listening on http://{address}");
-        println!("export ANTHROPIC_BASE_URL=http://{address}");
-        println!("export ANTHROPIC_AUTH_TOKEN={client_token}");
+        println!(
+            "subhub {} gateway listening on http://{address}",
+            options.transport.name()
+        );
+        if options.transport == GatewayTransport::Direct {
+            println!("export ANTHROPIC_BASE_URL=http://{address}");
+            println!("export ANTHROPIC_AUTH_TOKEN={client_token}");
+        } else {
+            println!(
+                "Iron TransformService listening on {}",
+                iron_grpc_address.expect("Iron mode validates its gRPC listener")
+            );
+            println!("Run `subhub gateway iron-config` for the matching Iron configuration.");
+        }
         println!("Press Ctrl-C to stop.");
     }
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+    if options.transport == GatewayTransport::Iron {
+        serve_iron(
+            listener,
+            app,
+            iron_grpc_address.expect("Iron mode validates its gRPC listener"),
+            state,
+        )
         .await
-        .map_err(|error| Error::Message(format!("proxy server failed: {error}")))
+    } else {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await
+            .map_err(|error| Error::Message(format!("proxy server failed: {error}")))
+    }
+}
+
+async fn serve_iron(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    grpc_address: std::net::SocketAddr,
+    state: ProxyState,
+) -> Result<()> {
+    use iron::proto::transform_service_server::TransformServiceServer;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let http = axum::serve(listener, app)
+        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
+        .into_future();
+    let grpc = tonic::transport::Server::builder()
+        .add_service(TransformServiceServer::new(iron::IronTransform::new(state)))
+        .serve_with_shutdown(grpc_address, wait_for_shutdown(shutdown_rx));
+    tokio::pin!(http);
+    tokio::pin!(grpc);
+    tokio::select! {
+        result = &mut http => {
+            let _ = shutdown_tx.send(true);
+            result.map_err(|error| Error::Message(format!("gateway HTTP server failed: {error}")))?;
+            grpc.await.map_err(|error| Error::Message(format!("Iron gRPC server failed: {error}")))
+        }
+        result = &mut grpc => {
+            let _ = shutdown_tx.send(true);
+            result.map_err(|error| Error::Message(format!("Iron gRPC server failed: {error}")))?;
+            http.await.map_err(|error| Error::Message(format!("gateway HTTP server failed: {error}")))
+        }
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(|error| Error::Message(format!("could not listen for shutdown: {error}")))?;
+            let _ = shutdown_tx.send(true);
+            let (http_result, grpc_result) = tokio::join!(http, grpc);
+            http_result.map_err(|error| Error::Message(format!("gateway HTTP server failed: {error}")))?;
+            grpc_result.map_err(|error| Error::Message(format!("Iron gRPC server failed: {error}")))
+        }
+    }
+}
+
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            break;
+        }
+    }
 }

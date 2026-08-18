@@ -78,7 +78,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Manage the local Anthropic credential gateway
+    /// Manage the local Claude and Codex credential gateway
     Gateway {
         #[command(subcommand)]
         command: GatewayCommands,
@@ -87,7 +87,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum GatewayCommands {
-    /// Run the local credential-routing Anthropic proxy
+    /// Run the local credential-routing gateway
     Serve {
         /// Loopback address to listen on
         #[arg(long, default_value = "127.0.0.1:7842")]
@@ -101,14 +101,34 @@ enum GatewayCommands {
         /// Seconds between background usage audits
         #[arg(long, default_value_t = 120)]
         audit_interval: u64,
+        /// Request transport: direct Subhub proxying or Iron control plane
+        #[arg(long, value_enum, default_value = "direct")]
+        transport: GatewayTransportArg,
+        /// Loopback address for Iron's external TransformService
+        #[arg(long, default_value = "127.0.0.1:7843")]
+        iron_grpc_listen: String,
+        /// Dedicated bearer used by Iron's response-retry callbacks
+        #[arg(long, env = "SUBHUB_IRON_RETRY_TOKEN")]
+        iron_retry_token: Option<String>,
+        /// Expected Iron sandbox identity in retry callbacks
+        #[arg(long, env = "SUBHUB_IRON_SANDBOX_ID", default_value = "local-user")]
+        iron_sandbox_id: String,
         /// Internal LaunchAgent mode
         #[arg(long, hide = true)]
         background: bool,
     },
     /// Install and start the background gateway
-    Install,
+    Install {
+        /// Request transport to configure for Claude Code and Codex
+        #[arg(long, value_enum, default_value = "direct")]
+        transport: GatewayTransportArg,
+    },
     /// Run uninstall then install in a single command, preserving saved credentials
-    Reinstall,
+    Reinstall {
+        /// Request transport to configure for Claude Code and Codex
+        #[arg(long, value_enum, default_value = "direct")]
+        transport: GatewayTransportArg,
+    },
     /// Stop the gateway and remove its Claude integration
     Uninstall {
         /// Also remove Subhub credentials, token, and index
@@ -137,6 +157,13 @@ enum GatewayCommands {
     Doctor,
     /// Print the local gateway authentication token
     AuthToken,
+    /// Print an Iron Proxy configuration fragment without embedding secrets
+    IronConfig,
+    /// Print the dedicated Iron response-retry callback token
+    IronToken,
+    /// Internal placeholder credential used by clients in Iron mode
+    #[command(hide = true)]
+    ProxyToken,
     /// Internal Claude Code status-line renderer
     #[command(hide = true)]
     Statusline,
@@ -146,6 +173,22 @@ enum GatewayCommands {
 enum ProviderArg {
     Claude,
     Codex,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum GatewayTransportArg {
+    #[default]
+    Direct,
+    Iron,
+}
+
+impl From<GatewayTransportArg> for gateway::GatewayTransport {
+    fn from(transport: GatewayTransportArg) -> Self {
+        match transport {
+            GatewayTransportArg::Direct => Self::Direct,
+            GatewayTransportArg::Iron => Self::Iron,
+        }
+    }
 }
 
 impl From<ProviderArg> for Provider {
@@ -185,22 +228,39 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
             client_token,
             reserve_percent,
             audit_interval,
+            transport,
+            iron_grpc_listen,
+            iron_retry_token,
+            iron_sandbox_id,
             background,
         } => {
             retire_active_claude_credential(index)?;
             let credentials = stored_credentials(index)?;
+            let transport = gateway::GatewayTransport::from(transport);
+            let iron_retry_token = if transport == gateway::GatewayTransport::Iron {
+                Some(match iron_retry_token {
+                    Some(token) => token,
+                    None => service::ensure_iron_retry_token()?,
+                })
+            } else {
+                None
+            };
             runtime()?.block_on(gateway::serve(gateway::ServeOptions {
                 listen,
                 client_token,
                 reserve_percent,
                 audit_interval,
                 background,
+                transport,
+                iron_grpc_listen,
+                iron_retry_token,
+                iron_sandbox_id,
                 initial_selected: index.active_names(),
                 credentials,
             }))
         }
-        GatewayCommands::Install => service::install(),
-        GatewayCommands::Reinstall => service::reinstall(),
+        GatewayCommands::Install { transport } => service::install(transport.into()),
+        GatewayCommands::Reinstall { transport } => service::reinstall(transport.into()),
         GatewayCommands::Uninstall { purge } => service::uninstall(purge),
         GatewayCommands::Start => service::start(),
         GatewayCommands::Stop => service::stop(),
@@ -210,6 +270,15 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
         GatewayCommands::Doctor => service::doctor(),
         GatewayCommands::AuthToken => {
             println!("{}", service::read_gateway_token()?);
+            Ok(())
+        }
+        GatewayCommands::IronConfig => service::print_iron_config(),
+        GatewayCommands::IronToken => {
+            println!("{}", service::ensure_iron_retry_token()?);
+            Ok(())
+        }
+        GatewayCommands::ProxyToken => {
+            println!("{}", service::ensure_iron_proxy_token()?);
             Ok(())
         }
         GatewayCommands::Statusline => service::statusline(),

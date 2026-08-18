@@ -11,6 +11,8 @@ that still has capacity.
 - Multiple named Claude Code and Codex accounts.
 - Usage visibility and capacity-aware routing.
 - Session affinity with one safe retry after pre-stream `401` or `429` errors.
+- Optional Iron Proxy integration that keeps Iron as the egress data plane and
+  uses Subhub as the dynamic credential-pool control plane.
 - A persistent per-user macOS LaunchAgent or Linux systemd service.
 - Keychain-backed storage on macOS and permission-restricted file storage on Linux.
 
@@ -56,24 +58,29 @@ subhub set <name> [--provider claude|codex]
                                   Select the gateway's preferred account
 subhub audit [--json]             Show subscription usage
 
-subhub gateway install            Install and start the background gateway
-subhub gateway reinstall          Uninstall then install, preserving accounts
+subhub gateway install [--transport direct|iron]
+                                  Install and start the background gateway
+subhub gateway reinstall [--transport direct|iron]
+                                  Uninstall then install, preserving accounts
 subhub gateway status [--provider claude|codex]
                                   Show gateway health, optionally filtered
 subhub gateway logs [--lines 100] Show structured gateway events
 subhub gateway doctor             Diagnose routing and credential health
 subhub gateway start|stop|restart Manage the gateway
 subhub gateway uninstall [--purge]
-subhub gateway serve              Run the gateway in the foreground
+subhub gateway serve [--transport direct|iron]
+                                  Run the gateway in the foreground
 subhub gateway auth-token         Print the local gateway token
+subhub gateway iron-config        Print the pinned Iron configuration fragment
+subhub gateway iron-token         Print the dedicated retry callback token
 ```
 
 ## How it works
 
-The authenticated gateway listens only on `127.0.0.1:7842`. It audits account
-capacity every two minutes and keeps using the selected credential while it is
-available. A pre-stream `401` or `429` may be retried once with another eligible
-credential; interrupted streams are never replayed.
+The direct gateway (the default) listens only on `127.0.0.1:7842`. It audits
+account capacity every two minutes and keeps using the selected credential
+while it is available. A pre-stream `401` or `429` may be retried once;
+interrupted streams are never replayed.
 
 Claude Code requests are forwarded to Anthropic using saved Claude accounts.
 Codex Responses API requests arrive under `/openai` and are forwarded to the
@@ -92,17 +99,81 @@ claude
 The local token authenticates clients to Subhub and is never forwarded
 upstream. The gateway does not log request or response contents.
 
+## Iron Proxy mode
+
+Iron mode keeps [Iron Proxy](https://github.com/ironsh/iron-proxy) as the only
+request data plane. Claude Code and Codex use their official provider URLs and
+receive only an inert placeholder credential. Iron terminates the sandbox TLS
+connection and asks Subhub which real credential headers to attach through
+Iron's external gRPC transform API:
+
+```text
+Claude Code / Codex
+        │ official provider URL + inert placeholder
+        ▼
+Iron Proxy ── gRPC TransformRequest ──► Subhub credential pool
+        │                                  │ select account A
+        │◄──────── modified headers ───────┘
+        ▼
+Anthropic / Codex
+        │ replayable 429
+        ▼
+Iron Proxy ── retry callback ─────────► Subhub selects account B
+        └──────── one exact replay ───► provider
+```
+
+The integration is pinned to Iron `v0.50.0-rc.3`. Start Subhub on the same host
+or network namespace as Iron, merge the generated fragment into Iron's main
+YAML configuration, and export the five commented retry-handler variables
+shown at its end:
+
+```sh
+subhub gateway serve --transport iron
+subhub gateway iron-config > subhub-iron-fragment.yaml
+```
+
+The default local layout is:
+
+```text
+127.0.0.1:7842  Subhub admin and authenticated Iron retry callbacks
+127.0.0.1:7843  Subhub TransformService (plaintext gRPC)
+```
+
+Only `POST https://api.anthropic.com/v1/messages` and
+`POST https://chatgpt.com/backend-api/codex/responses` can receive credentials.
+Subhub replaces client-supplied `authorization` and `x-api-key` headers and
+preserves other client headers. It does not enable Iron's optional
+`header_allowlist`; add one only after observing every header required by the
+specific Claude Code and Codex versions in use.
+
+The sandbox must trust Iron's MITM CA. Iron validates the providers' public
+certificates normally. Iron-to-Subhub traffic is plaintext loopback, so this
+local mode introduces no second CA. If Iron runs in a separate container,
+`127.0.0.1` refers to that container; use a shared network namespace (for
+example host networking on Linux) rather than exposing Subhub's control ports.
+
+Iron may ask Subhub for one exact replay when the provider returns `401` or
+`429` and the complete request body fits Iron's configured buffer. A `429`
+marks account A exhausted and retries with eligible account B. A Claude `401`
+force-refreshes A and retries with the same identity; Codex `401` responses are
+not switched mid-request. Unknown destinations, mismatched correlation,
+non-replayable bodies, and second retry attempts are refused. SSE responses
+are not migrated after streaming begins.
+
 ## Background integration
 
 `subhub gateway install` creates and starts a per-user macOS LaunchAgent or
-Linux systemd user service. It configures Claude Code with the local Anthropic base
-URL and a secure-storage-backed authentication helper. It also adds a status-line
-segment showing the routed Claude account and cached usage.
+Linux systemd user service. Direct mode configures Claude Code with the local
+Anthropic base URL. `--transport iron` retains the official Anthropic URL.
+Both modes use a secure-storage-backed authentication helper and add a
+status-line segment showing the routed Claude account and cached usage.
 
 For Codex, installation adds a `subhub` Responses API provider to
 `~/.codex/config.toml`, points `model_provider` at it, and configures the same
-local authentication helper. Uninstall restores the prior Claude and Codex
-settings when their current values are still managed by Subhub.
+local authentication helper. Iron mode uses the official ChatGPT Codex base
+URL and makes both helpers return only the inert placeholder. Uninstall restores
+the prior Claude and Codex settings when their current values are still managed
+by Subhub.
 
 If the service needs to be rebuilt, run:
 

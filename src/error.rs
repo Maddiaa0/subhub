@@ -1,5 +1,5 @@
 //! Crate-wide typed errors. Routing decisions depend on error *kinds*
-//! (refresh vs transient vs fatal audit), never on matching message text.
+//! (refresh, audit, or inference), never on matching message text.
 
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +85,7 @@ pub(crate) enum ErrorKind {
     Refresh,
     TransientAudit,
     FatalAudit,
+    Inference,
 }
 
 /// A credential failure as stored in gateway health and reported over the

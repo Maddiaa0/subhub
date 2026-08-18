@@ -124,6 +124,10 @@ pub(super) async fn routing_error_message(state: &ProxyState, provider: Provider
             .and_then(|entry| entry.error.as_ref())
     });
     match detail {
+        Some(error) if error.kind == ErrorKind::Inference => format!(
+            "credential is unavailable after a provider inference failure: {}",
+            error.message
+        ),
         Some(error) => format!(
             "credential usage is unknown because its latest audit failed: {}",
             error.message
@@ -135,11 +139,12 @@ pub(super) async fn routing_error_message(state: &ProxyState, provider: Provider
 pub(super) async fn mark_failed(state: &ProxyState, name: &str, status: StatusCode) {
     if let Some(health) = state.health.write().await.get_mut(name) {
         health.error = Some(CredentialError {
-            kind: if status == StatusCode::UNAUTHORIZED {
-                ErrorKind::FatalAudit
-            } else {
-                ErrorKind::TransientAudit
-            },
+            // This is direct evidence from the inference API, not an audit
+            // transport failure. In particular, an account that returned 429
+            // must not immediately re-enter the transient-audit fallback when
+            // no usage snapshot is available. A later successful audit clears
+            // this state and makes the credential eligible again.
+            kind: ErrorKind::Inference,
             message: format!("inference request returned {status}"),
         });
         if status == StatusCode::UNAUTHORIZED {
@@ -219,6 +224,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(selected.name, "full");
+    }
+
+    #[tokio::test]
+    async fn inference_rate_limit_is_not_reused_by_transient_audit_fallback() {
+        let state = test_state();
+        for health in state.health.write().await.values_mut() {
+            health.usage = None;
+            health.error = Some(CredentialError {
+                kind: ErrorKind::TransientAudit,
+                message: "usage request timed out".into(),
+            });
+        }
+        let first = select_credential(&state, None, None, Provider::Claude)
+            .await
+            .unwrap();
+        assert_eq!(first.name, "full");
+
+        mark_failed(&state, "full", StatusCode::TOO_MANY_REQUESTS).await;
+        let second = select_credential(&state, None, None, Provider::Claude)
+            .await
+            .unwrap();
+        assert_eq!(second.name, "ready");
+        assert_eq!(
+            state.health.read().await["full"]
+                .error
+                .as_ref()
+                .unwrap()
+                .kind,
+            ErrorKind::Inference
+        );
     }
 
     #[tokio::test]

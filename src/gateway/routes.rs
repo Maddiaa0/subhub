@@ -4,10 +4,11 @@
 use super::audit::audit_all;
 use super::protocol::{CredentialReport, GatewayStatus, SelectedReport, TokenState};
 use super::refresh::REFRESH_MARGIN_MS;
-use super::refresh::refresh_credential;
-use super::selection::{
-    mark_failed, routing_error_message, select_credential, set_selected_account,
+use super::routing::{
+    apply_credential_headers, refresh_after_unauthorized, request_model, rotate_after_failure,
+    select_initial,
 };
+use super::selection::set_selected_account;
 use super::state::{ProxyState, persisted_refresh_backoffs};
 use crate::provider::{Provider, StoredCredential};
 use crate::{Error, Result};
@@ -116,6 +117,8 @@ pub(super) async fn status(State(state): State<ProxyState>, headers: HeaderMap) 
         .collect();
     let selected = state.selected.lock().await.clone();
     let status = GatewayStatus {
+        transport: state.transport,
+        outstanding_iron_attempts: state.iron_attempts.lock().await.len(),
         selected: SelectedReport {
             claude: selected.claude,
             codex: selected.codex,
@@ -143,30 +146,17 @@ pub(super) async fn proxy(State(state): State<ProxyState>, request: Request) -> 
             );
         }
     };
-    let model = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("model")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned)
-        });
+    let model = request_model(&bytes);
 
-    let first = match select_credential(&state, model.as_deref(), None, provider).await {
-        Some(credential) => credential,
-        None => {
-            return error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                &routing_error_message(&state, provider).await,
-            );
+    let first = match select_initial(&state, provider, model.as_deref()).await {
+        Ok(credential) => credential,
+        Err(error) => {
+            return error_response(StatusCode::TOO_MANY_REQUESTS, &error.to_string());
         }
     };
     match forward(&state, &parts, bytes.clone(), &first).await {
         Ok(mut response) if response.status() == StatusCode::UNAUTHORIZED => {
-            if first.provider.supports_refresh()
-                && let Ok(refreshed) =
-                    refresh_credential(&state, &first.name, true, Some(&first.access_token)).await
-            {
+            if let Ok(refreshed) = refresh_after_unauthorized(&state, &first).await {
                 match forward(&state, &parts, bytes.clone(), &refreshed).await {
                     Ok(retried) if retried.status() != StatusCode::UNAUTHORIZED => {
                         return into_axum_response(retried);
@@ -177,9 +167,9 @@ pub(super) async fn proxy(State(state): State<ProxyState>, request: Request) -> 
                     }
                 }
             }
-            mark_failed(&state, &first.name, StatusCode::UNAUTHORIZED).await;
             if let Some(second) =
-                select_credential(&state, model.as_deref(), Some(&first.name), provider).await
+                rotate_after_failure(&state, &first, model.as_deref(), StatusCode::UNAUTHORIZED)
+                    .await
             {
                 return forward(&state, &parts, bytes, &second)
                     .await
@@ -192,9 +182,8 @@ pub(super) async fn proxy(State(state): State<ProxyState>, request: Request) -> 
         }
         Ok(response) if response.status() == StatusCode::TOO_MANY_REQUESTS => {
             let status = response.status();
-            mark_failed(&state, &first.name, status).await;
             if let Some(second) =
-                select_credential(&state, model.as_deref(), Some(&first.name), provider).await
+                rotate_after_failure(&state, &first, model.as_deref(), status).await
             {
                 return forward(&state, &parts, bytes, &second)
                     .await
@@ -223,18 +212,7 @@ async fn forward(
         .unwrap_or("/");
     let upstream = credential.provider.upstream();
     let path = credential.provider.rewrite_upstream_path(path);
-    let mut request = state
-        .client
-        .request(parts.method.clone(), format!("{upstream}{path}"))
-        .bearer_auth(&credential.access_token)
-        .body(body);
-    request = match credential.provider {
-        Provider::Claude => request.header("anthropic-beta", oauth_beta_header(&parts.headers)),
-        Provider::Codex => request.header("openai-beta", "codex-1"),
-    };
-    if let Some(account) = &credential.account_id {
-        request = request.header("chatgpt-account-id", account);
-    }
+    let mut headers = HeaderMap::new();
     for (name, value) in &parts.headers {
         if !matches!(
             name.as_str(),
@@ -244,35 +222,19 @@ async fn forward(
                 | "content-length"
                 | "connection"
                 | "proxy-authorization"
-                | "anthropic-beta"
-                | "openai-beta"
         ) {
-            request = request.header(name, value);
+            headers.append(name, value.clone());
         }
     }
-    request
+    apply_credential_headers(&mut headers, credential)?;
+    state
+        .client
+        .request(parts.method.clone(), format!("{upstream}{path}"))
+        .headers(headers)
+        .body(body)
         .send()
         .await
         .map_err(|error| Error::Message(format!("upstream request failed: {error}")))
-}
-
-fn oauth_beta_header(headers: &HeaderMap) -> String {
-    const OAUTH_BETA: &str = "oauth-2025-04-20";
-    let existing = headers
-        .get("anthropic-beta")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if existing
-        .split(',')
-        .map(str::trim)
-        .any(|value| value == OAUTH_BETA)
-    {
-        existing.to_owned()
-    } else if existing.is_empty() {
-        OAUTH_BETA.into()
-    } else {
-        format!("{existing},{OAUTH_BETA}")
-    }
 }
 
 fn authorized(state: &ProxyState, headers: &HeaderMap) -> bool {
@@ -304,7 +266,7 @@ fn into_axum_response(response: reqwest::Response) -> Response {
         .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR, "response error"))
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response {
+pub(super) fn error_response(status: StatusCode, message: &str) -> Response {
     json_response(
         status,
         serde_json::json!({
@@ -314,7 +276,7 @@ fn error_response(status: StatusCode, message: &str) -> Response {
     )
 }
 
-fn json_response(status: StatusCode, value: serde_json::Value) -> Response {
+pub(super) fn json_response(status: StatusCode, value: serde_json::Value) -> Response {
     Response::builder()
         .status(status)
         .header("content-type", HeaderValue::from_static("application/json"))
@@ -338,21 +300,5 @@ mod tests {
         assert!(authorized(&state, &headers));
         headers.insert("x-api-key", "wrong".parse().unwrap());
         assert!(!authorized(&state, &headers));
-    }
-
-    #[test]
-    fn oauth_beta_is_added_without_discarding_client_features() {
-        let mut headers = HeaderMap::new();
-        assert_eq!(oauth_beta_header(&headers), "oauth-2025-04-20");
-        headers.insert("anthropic-beta", "feature-a,feature-b".parse().unwrap());
-        assert_eq!(
-            oauth_beta_header(&headers),
-            "feature-a,feature-b,oauth-2025-04-20"
-        );
-        headers.insert(
-            "anthropic-beta",
-            "feature-a,oauth-2025-04-20".parse().unwrap(),
-        );
-        assert_eq!(oauth_beta_header(&headers), "feature-a,oauth-2025-04-20");
     }
 }

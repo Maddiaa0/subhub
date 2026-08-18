@@ -12,10 +12,11 @@ pub(crate) use gateway_client::{
 };
 
 use crate::credentials::{restore_active_claude_credential, retire_active_claude_credential};
+use crate::gateway::GatewayTransport;
 use crate::output::{print_gateway_health, yes_no};
 use crate::{
-    Error, Result, VAULT_SERVICE, credential_delete, credential_write, index_path, load_index,
-    save_json_file,
+    Error, Result, VAULT_SERVICE, credential_delete, credential_read, credential_write, index_path,
+    load_index, save_json_file,
 };
 use claude_settings::{
     claude_settings_path, ensure_no_conflicting_claude_credentials, get_nested,
@@ -40,6 +41,8 @@ use std::process::{Command, Stdio};
 
 const GATEWAY_SERVICE: &str = "subhub-gateway";
 const GATEWAY_TOKEN_ACCOUNT: &str = "local-client-token";
+const IRON_PROXY_TOKEN_ACCOUNT: &str = "iron-placeholder-token";
+const IRON_RETRY_TOKEN_ACCOUNT: &str = "iron-retry-token";
 pub(super) const BASE_URL: &str = "http://127.0.0.1:7842";
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -52,6 +55,8 @@ pub(super) struct PreviousValue {
 pub(super) struct InstallState {
     version: u8,
     binary_path: PathBuf,
+    #[serde(default)]
+    pub(super) transport: GatewayTransport,
     pub(super) previous_base_url: PreviousValue,
     pub(super) previous_api_key_helper: PreviousValue,
     #[serde(default)]
@@ -61,17 +66,49 @@ pub(super) struct InstallState {
 }
 
 fn ensure_gateway_token() -> Result<String> {
-    if let Ok(token) = read_gateway_token()
+    ensure_service_token(GATEWAY_TOKEN_ACCOUNT)
+}
+
+pub(crate) fn ensure_iron_proxy_token() -> Result<String> {
+    ensure_service_token(IRON_PROXY_TOKEN_ACCOUNT)
+}
+
+pub(crate) fn ensure_iron_retry_token() -> Result<String> {
+    ensure_service_token(IRON_RETRY_TOKEN_ACCOUNT)
+}
+
+pub(crate) fn read_iron_retry_token() -> Result<String> {
+    credential_read(GATEWAY_SERVICE, IRON_RETRY_TOKEN_ACCOUNT)
+}
+
+fn ensure_service_token(account: &str) -> Result<String> {
+    if let Ok(token) = credential_read(GATEWAY_SERVICE, account)
         && !token.is_empty()
     {
         return Ok(token);
     }
     let token = Alphanumeric.sample_string(&mut rand::rng(), 48);
-    credential_write(GATEWAY_SERVICE, GATEWAY_TOKEN_ACCOUNT, &token)?;
+    credential_write(GATEWAY_SERVICE, account, &token)?;
     Ok(token)
 }
 
-pub(crate) fn install() -> Result<()> {
+impl InstallState {
+    pub(super) fn managed_claude_base_url(&self) -> &'static str {
+        match self.transport {
+            GatewayTransport::Direct => BASE_URL,
+            GatewayTransport::Iron => "https://api.anthropic.com",
+        }
+    }
+
+    pub(super) fn managed_codex_base_url(&self) -> &'static str {
+        match self.transport {
+            GatewayTransport::Direct => BASE_URL,
+            GatewayTransport::Iron => crate::codex::RESPONSES_UPSTREAM,
+        }
+    }
+}
+
+pub(crate) fn install(transport: GatewayTransport) -> Result<()> {
     let binary_path = env::current_exe().map_err(|error| {
         Error::Message(format!("could not resolve the Subhub executable: {error}"))
     })?;
@@ -87,8 +124,9 @@ pub(crate) fn install() -> Result<()> {
         read_install_state(&state_path)?
     } else {
         InstallState {
-            version: 1,
+            version: 2,
             binary_path: binary_path.clone(),
+            transport,
             previous_base_url: get_nested(&settings, &["env", "ANTHROPIC_BASE_URL"]),
             previous_api_key_helper: get_nested(&settings, &["apiKeyHelper"]),
             previous_status_line: Some(get_nested(&settings, &["statusLine"])),
@@ -103,10 +141,20 @@ pub(crate) fn install() -> Result<()> {
         .or_else(|| Some(get_nested(&settings, &["statusLine"])));
 
     ensure_gateway_token()?;
+    if transport == GatewayTransport::Iron {
+        ensure_iron_proxy_token()?;
+        ensure_iron_retry_token()?;
+    }
     set_nested(
         &mut settings,
         &["env", "ANTHROPIC_BASE_URL"],
-        Value::String(BASE_URL.into()),
+        Value::String(
+            match transport {
+                GatewayTransport::Direct => BASE_URL,
+                GatewayTransport::Iron => "https://api.anthropic.com",
+            }
+            .into(),
+        ),
     )?;
     set_nested(
         &mut settings,
@@ -124,22 +172,32 @@ pub(crate) fn install() -> Result<()> {
     )?;
 
     let current_state = InstallState {
+        version: 2,
         binary_path: binary_path.clone(),
+        transport,
         previous_status_line,
         ..state
     };
     save_json_file(&state_path, &current_state)?;
     save_json_file(&settings_path, &settings)?;
-    install_codex_config()?;
-    write_auth_helper(&auth_helper_path()?, &binary_path)?;
+    install_codex_config(transport)?;
+    write_auth_helper(&auth_helper_path()?, &binary_path, transport)?;
     write_statusline_helper(&statusline_helper_path()?, &binary_path)?;
     let agent_path = background_service_path()?;
-    write_background_service(&agent_path, &binary_path)?;
+    write_background_service(&agent_path, &binary_path, transport)?;
     restart()?;
 
-    println!("Subhub gateway installed and running.");
-    println!("Claude Code will use {BASE_URL} automatically.");
-    println!("Codex CLI will use {BASE_URL}/openai automatically.");
+    println!("Subhub {} gateway installed and running.", transport.name());
+    match transport {
+        GatewayTransport::Direct => {
+            println!("Claude Code will use {BASE_URL} automatically.");
+            println!("Codex CLI will use {BASE_URL}/openai automatically.");
+        }
+        GatewayTransport::Iron => {
+            println!("Claude Code and Codex will use their official provider endpoints.");
+            println!("Run `subhub gateway iron-config` to configure Iron Proxy.");
+        }
+    }
     Ok(())
 }
 
@@ -200,9 +258,9 @@ pub(crate) fn uninstall(purge: bool) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn reinstall() -> Result<()> {
+pub(crate) fn reinstall(transport: GatewayTransport) -> Result<()> {
     uninstall(false)?;
-    install()
+    install(transport)
 }
 
 pub(crate) fn start() -> Result<()> {
@@ -239,6 +297,10 @@ pub(crate) fn status(provider: Option<crate::Provider>) -> Result<()> {
     println!("Installed: {}", yes_no(installed));
     println!("Running:   {}", yes_no(running));
     println!("Endpoint:  {BASE_URL}");
+    if installed {
+        let state = read_install_state(&install_state_path()?)?;
+        println!("Transport: {}", state.transport.name());
+    }
     println!(
         "Token:     {}",
         if read_gateway_token().is_ok() {
@@ -273,6 +335,68 @@ pub(crate) fn logs(lines: usize) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn print_iron_config() -> Result<()> {
+    ensure_iron_proxy_token()?;
+    ensure_iron_retry_token()?;
+    println!("{}", iron_config());
+    Ok(())
+}
+
+fn iron_config() -> &'static str {
+    r#"# Merge this fragment into iron-proxy's configuration.
+# SubHub remains on loopback; only the sandbox needs to trust Iron's MITM CA.
+proxy:
+  max_request_body_bytes: 1048576
+
+transforms:
+  - name: allowlist
+    config:
+      rules:
+        # Required when clients use Iron's CONNECT/SOCKS5 tunnel listener.
+        # The later request rule and SubHub transform still enforce the exact
+        # inference method and path inside the tunnel.
+        - host: "api.anthropic.com"
+          methods: ["CONNECT"]
+        - host: "api.anthropic.com"
+          methods: ["POST"]
+          paths: ["/v1/messages"]
+        - host: "chatgpt.com"
+          methods: ["CONNECT"]
+        - host: "chatgpt.com"
+          methods: ["POST"]
+          paths: ["/backend-api/codex/responses"]
+
+  - name: grpc
+    config:
+      name: "subhub-pool"
+      target: "127.0.0.1:7843"
+      send_request_body: true
+      send_response_body: false
+      rules:
+        - host: "api.anthropic.com"
+          methods: ["POST"]
+          paths: ["/v1/messages"]
+        - host: "chatgpt.com"
+          methods: ["POST"]
+          paths: ["/backend-api/codex/responses"]
+
+# SubHub replaces Authorization and x-api-key itself. A header_allowlist is
+# intentionally not enabled here: Claude Code and Codex add version-specific
+# protocol headers, and silently stripping one can break otherwise valid
+# requests. Add Iron's header_allowlist only after observing the exact client
+# versions in use.
+
+# Evaluate these exports in the shell that starts Iron. They remain comments
+# here so this entire output is valid YAML. The command substitution retrieves
+# the dedicated callback token from secure storage; this fragment never
+# contains the token itself.
+# export IRON_RESPONSE_RETRY_HANDLER_URL=http://127.0.0.1:7842/_subhub/iron/retry/authorize
+# export IRON_RESPONSE_RETRY_COMPLETE_URL=http://127.0.0.1:7842/_subhub/iron/retry/complete
+# export IRON_RESPONSE_RETRY_HANDLER_SANDBOX_ID=local-user
+# export IRON_RESPONSE_RETRY_STATUSES=401,429
+# export IRON_RESPONSE_RETRY_HANDLER_TOKEN="$(subhub gateway iron-token)""#
 }
 
 pub(crate) fn doctor() -> Result<()> {
@@ -372,6 +496,8 @@ fn purge_data() -> Result<()> {
         })?;
     }
     let _ = credential_delete(GATEWAY_SERVICE, GATEWAY_TOKEN_ACCOUNT);
+    let _ = credential_delete(GATEWAY_SERVICE, IRON_PROXY_TOKEN_ACCOUNT);
+    let _ = credential_delete(GATEWAY_SERVICE, IRON_RETRY_TOKEN_ACCOUNT);
     Ok(())
 }
 
@@ -401,7 +527,7 @@ fn read_install_state(path: &Path) -> Result<InstallState> {
         .map_err(|error| Error::Message(format!("could not read {}: {error}", path.display())))?;
     let state: InstallState = serde_json::from_str(&contents)
         .map_err(|error| Error::Message(format!("invalid {}: {error}", path.display())))?;
-    if state.version != 1 {
+    if !matches!(state.version, 1 | 2) {
         return Err(Error::Message(format!(
             "unsupported install state version {}",
             state.version
@@ -422,12 +548,16 @@ pub(super) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn write_auth_helper(path: &Path, binary: &Path) -> Result<()> {
+fn write_auth_helper(path: &Path, binary: &Path, transport: GatewayTransport) -> Result<()> {
+    let command = match transport {
+        GatewayTransport::Direct => "auth-token",
+        GatewayTransport::Iron => "proxy-token",
+    };
     write_executable_helper(
         path,
         &format!(
-            "#!/bin/sh\nexec {} gateway auth-token\n",
-            shell_quote(binary)
+            "#!/bin/sh\nexec {} gateway {command}\n",
+            shell_quote(binary),
         ),
     )
 }
@@ -486,15 +616,21 @@ mod tests {
         ));
         let agent = directory.join("agent.plist");
         let helper = directory.join("auth-token");
+        let iron_agent = directory.join("iron-agent.plist");
+        let iron_helper = directory.join("iron-auth-token");
         let statusline = directory.join("statusline");
         let binary = Path::new("/Applications/Sub Hub/subhub");
 
-        write_background_service(&agent, binary).unwrap();
-        write_auth_helper(&helper, binary).unwrap();
+        write_background_service(&agent, binary, GatewayTransport::Direct).unwrap();
+        write_auth_helper(&helper, binary, GatewayTransport::Direct).unwrap();
+        write_background_service(&iron_agent, binary, GatewayTransport::Iron).unwrap();
+        write_auth_helper(&iron_helper, binary, GatewayTransport::Iron).unwrap();
         write_statusline_helper(&statusline, binary).unwrap();
 
         let agent_contents = fs::read_to_string(&agent).unwrap();
         let helper_contents = fs::read_to_string(&helper).unwrap();
+        let iron_agent_contents = fs::read_to_string(&iron_agent).unwrap();
+        let iron_helper_contents = fs::read_to_string(&iron_helper).unwrap();
         let statusline_contents = fs::read_to_string(&statusline).unwrap();
         #[cfg(target_os = "macos")]
         assert!(agent_contents.contains("<string>gateway</string>"));
@@ -506,9 +642,16 @@ mod tests {
                 .contains("ExecStart=\"/Applications/Sub Hub/subhub\" gateway serve --background")
         );
         assert!(!agent_contents.contains("local-client-token"));
+        assert!(!iron_agent_contents.contains("iron-retry-token"));
+        assert!(iron_agent_contents.contains("--transport"));
+        assert!(iron_agent_contents.contains("iron"));
         assert_eq!(
             helper_contents,
             "#!/bin/sh\nexec '/Applications/Sub Hub/subhub' gateway auth-token\n"
+        );
+        assert_eq!(
+            iron_helper_contents,
+            "#!/bin/sh\nexec '/Applications/Sub Hub/subhub' gateway proxy-token\n"
         );
         assert_eq!(
             statusline_contents,
@@ -519,5 +662,30 @@ mod tests {
             0o700
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn generated_iron_config_references_tokens_without_embedding_them() {
+        let config = iron_config();
+        assert!(config.contains("name: grpc"));
+        assert!(config.contains("target: \"127.0.0.1:7843\""));
+        assert!(config.contains("IRON_RESPONSE_RETRY_STATUSES=401,429"));
+        assert!(config.contains("subhub gateway iron-token"));
+        assert!(config.contains("paths: [\"/v1/messages\"]"));
+        assert!(config.contains("header_allowlist is"));
+        assert!(!config.contains("secret-a"));
+        assert!(!config.contains("secret-b"));
+    }
+
+    #[test]
+    fn legacy_install_state_defaults_to_direct_transport() {
+        let state: InstallState = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "binary_path": "/usr/local/bin/subhub",
+            "previous_base_url": {"present": false, "value": null},
+            "previous_api_key_helper": {"present": false, "value": null}
+        }))
+        .unwrap();
+        assert_eq!(state.transport, GatewayTransport::Direct);
     }
 }
