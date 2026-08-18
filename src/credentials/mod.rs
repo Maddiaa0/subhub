@@ -212,7 +212,7 @@ pub(crate) fn retire_active_claude_credential(index: &Index) -> Result<bool> {
     });
     if !is_saved {
         return Err(Error::Message(
-            "Claude Code has an active OAuth credential that is not saved in Subhub; run `subhub add <name>` before installing the gateway".into(),
+            "Claude Code has an active OAuth credential that is not saved in Subhub; run `subhub add <name> --capture` to import the current login before installing the gateway".into(),
         ));
     }
     clear_active_claude_oauth()

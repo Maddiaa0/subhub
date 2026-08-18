@@ -30,8 +30,9 @@ subhub gateway install
 
 To install from a local checkout, run `cargo install --path .`.
 
-`subhub add` prompts for Claude Code or Codex. Claude accounts are captured
-after the standard `claude auth login --claudeai` flow. Codex accounts are
+`subhub add` prompts for Claude Code or Codex. Claude accounts use the standard
+`claude auth login --claudeai` flow by default. Pass `--capture` to import
+Claude Code's current OAuth login without opening a browser. Codex accounts are
 captured after a standard `codex login` ChatGPT flow in an isolated temporary
 credential cache; pass `--device-auth` on remote or headless machines to use
 the device-code flow instead of a local browser. On macOS, tokens are stored in the login Keychain. On Linux,
@@ -46,8 +47,9 @@ shared or made group/world-readable.
 ## Commands
 
 ```text
-subhub add <name> [--force] [--device-auth]
+subhub add <name> [--force] [--capture] [--device-auth]
                                   Save or replace an account
+                                  (--capture: import Claude's current login)
                                   (--device-auth: Codex device-code login)
 subhub list                       List accounts and their providers
 subhub set <name> [--provider claude|codex]
@@ -120,7 +122,9 @@ The gateway is the sole owner of each Claude refresh-token family. After
 copy; Claude Code authenticates to the local gateway instead. Duplicate Claude
 account identities are rejected so aliases cannot race the same token family.
 Uninstalling the gateway returns the selected credential to Claude Code after
-the gateway has stopped.
+the gateway has stopped. With `--purge`, Subhub then deletes its own copy; a
+later `subhub add <name> --capture` imports Claude Code's current login without
+requiring another login.
 
 The gateway refreshes Claude OAuth credentials five minutes before access-token
 expiry and retries one pre-stream request after refreshing on an upstream 401.

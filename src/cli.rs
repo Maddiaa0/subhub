@@ -10,8 +10,8 @@ use crate::credentials::oauth::{
     validate_required_scopes, write_oauth_account,
 };
 use crate::credentials::vault::{
-    ACTIVE_SERVICE, VAULT_SERVICE, VaultEntry, credential_read, credential_write, current_user,
-    validate_credential, vault_read,
+    VAULT_SERVICE, VaultEntry, active_credential_read, credential_write, validate_credential,
+    vault_read,
 };
 use crate::credentials::{
     ensure_unique_claude_identity, retire_active_claude_credential, stored_credentials,
@@ -55,8 +55,11 @@ enum Commands {
         /// Replace an existing credential with the same name
         #[arg(long, short)]
         force: bool,
+        /// Capture Claude Code's current OAuth login instead of opening a new login
+        #[arg(long, conflicts_with = "device_auth")]
+        capture: bool,
         /// Use device-code authentication for the Codex login (for remote or headless machines)
-        #[arg(long, short = 'd')]
+        #[arg(long, short = 'd', conflicts_with = "capture")]
         device_auth: bool,
     },
     /// List saved credential names and mark the active one
@@ -162,8 +165,9 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         Commands::Add {
             name,
             force,
+            capture,
             device_auth,
-        } => add(&path, &mut index, &name, force, device_auth),
+        } => add(&path, &mut index, &name, force, capture, device_auth),
         Commands::List => list(&index),
         Commands::Set { name, provider } => set(&path, &mut index, &name, provider.map(Into::into)),
         Commands::Audit { json } => {
@@ -212,7 +216,14 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
     }
 }
 
-fn add(path: &Path, index: &mut Index, name: &str, force: bool, device_auth: bool) -> Result<()> {
+fn add(
+    path: &Path,
+    index: &mut Index,
+    name: &str,
+    force: bool,
+    capture: bool,
+    device_auth: bool,
+) -> Result<()> {
     validate_name(name)?;
     if index.contains(name) && !force {
         return Err(Error::Message(format!(
@@ -224,6 +235,11 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool, device_auth: boo
     let mut choice = String::new();
     io::stdin().read_line(&mut choice)?;
     if choice.trim() == "2" {
+        if capture {
+            return Err(Error::Message(
+                "--capture only applies to Claude Code logins; choose subscription type 1".into(),
+            ));
+        }
         return add_codex(path, index, name, device_auth);
     }
     if device_auth {
@@ -231,25 +247,34 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool, device_auth: boo
             "--device-auth only applies to Codex logins; choose subscription type 2".into(),
         ));
     }
-    println!("Opening Claude Code login for credential \"{name}\"...");
-    let oauth_scopes = requested_oauth_scopes(env::var_os(CLAUDE_OAUTH_SCOPES_ENV).as_deref());
-    let status = Command::new("claude")
-        .args(["auth", "login", "--claudeai"])
-        .env(CLAUDE_OAUTH_SCOPES_ENV, oauth_scopes)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|error| Error::Message(format!("could not run `claude auth login`: {error}")))?;
+    let credential = if capture {
+        println!("Capturing Claude Code's active login as credential \"{name}\"...");
+        active_claude_credential()?.ok_or_else(|| {
+            Error::Message(
+                "Claude Code has no active OAuth credential to capture; run `subhub add <name>` without `--capture` to log in".into(),
+            )
+        })?
+    } else {
+        println!("Opening Claude Code login for credential \"{name}\"...");
+        let oauth_scopes = requested_oauth_scopes(env::var_os(CLAUDE_OAUTH_SCOPES_ENV).as_deref());
+        let status = Command::new("claude")
+            .args(["auth", "login", "--claudeai"])
+            .env(CLAUDE_OAUTH_SCOPES_ENV, oauth_scopes)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|error| {
+                Error::Message(format!("could not run `claude auth login`: {error}"))
+            })?;
 
-    require_success(status, "`claude auth login` failed")?;
-
-    let account = current_user()?;
-    let credential = credential_read(ACTIVE_SERVICE, &account).map_err(|error| {
-        Error::Message(format!(
-            "login completed, but the Claude Code credential could not be read: {error}"
-        ))
-    })?;
+        require_success(status, "`claude auth login` failed")?;
+        active_credential_read()?.ok_or_else(|| {
+            Error::Message(
+                "login completed, but the Claude Code credential could not be read".into(),
+            )
+        })?
+    };
     validate_credential(&credential)?;
     validate_required_scopes(&credential)?;
     let credential_value: Value = serde_json::from_str(&credential)?;
@@ -283,6 +308,23 @@ fn add(path: &Path, index: &mut Index, name: &str, force: bool, device_auth: boo
     println!("Saved \"{name}\"; the Subhub gateway is now its sole OAuth-token owner.");
     notify_gateway_reload();
     Ok(())
+}
+
+fn active_claude_credential() -> Result<Option<String>> {
+    let Some(raw) = active_credential_read()? else {
+        return Ok(None);
+    };
+    let parsed: Value = serde_json::from_str(&raw).map_err(|error| {
+        Error::Message(format!(
+            "Claude Code's active credential is not valid JSON: {error}"
+        ))
+    })?;
+    if parsed.get("claudeAiOauth").is_none() {
+        return Ok(None);
+    }
+    validate_credential(&raw)?;
+    validate_required_scopes(&raw)?;
+    Ok(Some(raw))
 }
 
 /// A running gateway holds an in-memory vault snapshot, so a fresh login is
@@ -596,6 +638,23 @@ fn format_reset_time(reset: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_flag_is_exposed_for_add_and_conflicts_with_device_auth() {
+        let cli = Cli::try_parse_from(["subhub", "add", "personal", "--capture"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Add {
+                capture: true,
+                device_auth: false,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["subhub", "add", "personal", "--capture", "--device-auth"])
+                .is_err()
+        );
+    }
 
     #[test]
     fn reset_timestamp_is_human_readable() {
