@@ -71,7 +71,9 @@ subhub gateway uninstall [--purge]
 subhub gateway serve [--transport direct|iron]
                                   Run the gateway in the foreground
 subhub gateway auth-token         Print the local gateway token
-subhub gateway iron-config        Print the pinned Iron configuration fragment
+subhub gateway iron-config [--listen ADDR] [--iron-grpc-listen ADDR]
+                             [--iron-sandbox-id ID]
+                                  Print the pinned Iron configuration fragment
 subhub gateway iron-token         Print the dedicated retry callback token
 ```
 
@@ -145,6 +147,12 @@ Subhub replaces client-supplied `authorization` and `x-api-key` headers and
 preserves other client headers. It does not enable Iron's optional
 `header_allowlist`; add one only after observing every header required by the
 specific Claude Code and Codex versions in use.
+
+Subhub accepts inference request bodies up to 32 MiB in either transport.
+The generated Iron configuration buffers one additional byte so oversized
+requests are rejected with `413` instead of forwarding a truncated prefix.
+When using custom listener addresses or a custom sandbox ID, pass the same
+values to both `gateway serve` and `gateway iron-config`.
 
 The sandbox must trust Iron's MITM CA. Iron validates the providers' public
 certificates normally. Iron-to-Subhub traffic is plaintext loopback, so this

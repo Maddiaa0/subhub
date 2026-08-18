@@ -4,7 +4,7 @@
 use crate::codex;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Provider {
     #[default]
@@ -12,10 +12,25 @@ pub(crate) enum Provider {
     Codex,
 }
 
+/// The single inference endpoint on which a provider credential may be used.
+/// Both transports and the generated Iron policy derive their routing rules
+/// from this descriptor so adding a provider cannot leave a second endpoint
+/// table silently out of sync.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InferenceEndpoint {
+    pub(crate) host: &'static str,
+    pub(crate) method: &'static str,
+    pub(crate) path: &'static str,
+}
+
 /// Everything the gateway does differently per provider lives in this impl.
 /// Adding a provider means adding a variant and letting the compiler point
 /// at each exhaustive match that needs a decision.
 impl Provider {
+    pub(crate) fn all() -> &'static [Self] {
+        <Self as clap::ValueEnum>::value_variants()
+    }
+
     /// Lowercase identifier, matching the serde representation.
     pub(crate) fn name(self) -> &'static str {
         match self {
@@ -47,6 +62,32 @@ impl Provider {
             Self::Claude => "https://api.anthropic.com",
             Self::Codex => codex::RESPONSES_UPSTREAM,
         }
+    }
+
+    /// Exact public endpoint authorized to receive this provider's identity in
+    /// Iron mode.
+    pub(crate) fn inference_endpoint(self) -> InferenceEndpoint {
+        match self {
+            Self::Claude => InferenceEndpoint {
+                host: "api.anthropic.com",
+                method: "POST",
+                path: "/v1/messages",
+            },
+            Self::Codex => InferenceEndpoint {
+                host: "chatgpt.com",
+                method: "POST",
+                path: "/backend-api/codex/responses",
+            },
+        }
+    }
+
+    pub(crate) fn from_inference_endpoint(host: &str, method: &str, path: &str) -> Option<Self> {
+        Self::all().iter().copied().find(|provider| {
+            let endpoint = provider.inference_endpoint();
+            endpoint.host == host
+                && endpoint.method.eq_ignore_ascii_case(method)
+                && endpoint.path == path
+        })
     }
 
     /// Rewrite an incoming gateway path into the upstream's path space.
@@ -107,5 +148,16 @@ mod tests {
             Provider::Claude.rewrite_upstream_path("/v1/messages"),
             "/v1/messages"
         );
+    }
+
+    #[test]
+    fn inference_endpoints_round_trip_to_their_provider() {
+        for provider in Provider::all() {
+            let endpoint = provider.inference_endpoint();
+            assert_eq!(
+                Provider::from_inference_endpoint(endpoint.host, endpoint.method, endpoint.path),
+                Some(*provider)
+            );
+        }
     }
 }

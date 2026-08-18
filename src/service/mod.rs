@@ -14,6 +14,7 @@ pub(crate) use gateway_client::{
 use crate::credentials::{restore_active_claude_credential, retire_active_claude_credential};
 use crate::gateway::GatewayTransport;
 use crate::output::{print_gateway_health, yes_no};
+use crate::provider::Provider;
 use crate::{
     Error, Result, VAULT_SERVICE, credential_delete, credential_read, credential_write, index_path,
     load_index, save_json_file,
@@ -337,18 +338,66 @@ pub(crate) fn logs(lines: usize) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn print_iron_config() -> Result<()> {
+pub(crate) fn print_iron_config(listen: &str, iron: &crate::gateway::IronConfig) -> Result<()> {
+    let callback_address = loopback_address(listen, "gateway HTTP")?;
+    let grpc_address = loopback_address(&iron.grpc_listen, "Iron gRPC")?;
+    if callback_address == grpc_address {
+        return Err(Error::Message(
+            "Iron gRPC and gateway HTTP listeners must use different addresses".into(),
+        ));
+    }
+    if iron.sandbox_id.is_empty() {
+        return Err(Error::Message(
+            "Iron sandbox identity must not be empty".into(),
+        ));
+    }
     ensure_iron_proxy_token()?;
     ensure_iron_retry_token()?;
-    println!("{}", iron_config());
+    println!(
+        "{}",
+        iron_config(callback_address, grpc_address, &iron.sandbox_id)
+    );
     Ok(())
 }
 
-fn iron_config() -> &'static str {
-    r#"# Merge this fragment into iron-proxy's configuration.
+fn loopback_address(value: &str, label: &str) -> Result<std::net::SocketAddr> {
+    let address = value
+        .parse::<std::net::SocketAddr>()
+        .map_err(|error| Error::Message(format!("invalid {label} listen address: {error}")))?;
+    if !address.ip().is_loopback() {
+        return Err(Error::Message(format!(
+            "refusing non-loopback {label} listen address; local mode is loopback-only"
+        )));
+    }
+    Ok(address)
+}
+
+fn iron_config(
+    callback_address: std::net::SocketAddr,
+    grpc_address: std::net::SocketAddr,
+    sandbox_id: &str,
+) -> String {
+    let mut allowlist_rules = String::new();
+    let mut grpc_rules = String::new();
+    for provider in Provider::all() {
+        let endpoint = provider.inference_endpoint();
+        allowlist_rules.push_str(&format!(
+            "        - host: \"{}\"\n          methods: [\"CONNECT\"]\n        - host: \"{}\"\n          methods: [\"{}\"]\n          paths: [\"{}\"]\n",
+            endpoint.host, endpoint.host, endpoint.method, endpoint.path
+        ));
+        grpc_rules.push_str(&format!(
+            "        - host: \"{}\"\n          methods: [\"{}\"]\n          paths: [\"{}\"]\n",
+            endpoint.host, endpoint.method, endpoint.path
+        ));
+    }
+    let sandbox_id = shell_quote_value(sandbox_id);
+    format!(
+        r#"# Merge this fragment into iron-proxy's configuration.
 # SubHub remains on loopback; only the sandbox needs to trust Iron's MITM CA.
 proxy:
-  max_request_body_bytes: 1048576
+  # One byte above SubHub's accepted limit lets the transform reject an
+  # oversized request instead of forwarding a silently truncated prefix.
+  max_request_body_bytes: {buffered_body_bytes}
 
 transforms:
   - name: allowlist
@@ -357,31 +406,15 @@ transforms:
         # Required when clients use Iron's CONNECT/SOCKS5 tunnel listener.
         # The later request rule and SubHub transform still enforce the exact
         # inference method and path inside the tunnel.
-        - host: "api.anthropic.com"
-          methods: ["CONNECT"]
-        - host: "api.anthropic.com"
-          methods: ["POST"]
-          paths: ["/v1/messages"]
-        - host: "chatgpt.com"
-          methods: ["CONNECT"]
-        - host: "chatgpt.com"
-          methods: ["POST"]
-          paths: ["/backend-api/codex/responses"]
-
+{allowlist_rules}
   - name: grpc
     config:
       name: "subhub-pool"
-      target: "127.0.0.1:7843"
+      target: "{grpc_address}"
       send_request_body: true
       send_response_body: false
       rules:
-        - host: "api.anthropic.com"
-          methods: ["POST"]
-          paths: ["/v1/messages"]
-        - host: "chatgpt.com"
-          methods: ["POST"]
-          paths: ["/backend-api/codex/responses"]
-
+{grpc_rules}
 # SubHub replaces Authorization and x-api-key itself. A header_allowlist is
 # intentionally not enabled here: Claude Code and Codex add version-specific
 # protocol headers, and silently stripping one can break otherwise valid
@@ -392,11 +425,17 @@ transforms:
 # here so this entire output is valid YAML. The command substitution retrieves
 # the dedicated callback token from secure storage; this fragment never
 # contains the token itself.
-# export IRON_RESPONSE_RETRY_HANDLER_URL=http://127.0.0.1:7842/_subhub/iron/retry/authorize
-# export IRON_RESPONSE_RETRY_COMPLETE_URL=http://127.0.0.1:7842/_subhub/iron/retry/complete
-# export IRON_RESPONSE_RETRY_HANDLER_SANDBOX_ID=local-user
+# export IRON_RESPONSE_RETRY_HANDLER_URL=http://{callback_address}/_subhub/iron/retry/authorize
+# export IRON_RESPONSE_RETRY_COMPLETE_URL=http://{callback_address}/_subhub/iron/retry/complete
+# export IRON_RESPONSE_RETRY_HANDLER_SANDBOX_ID={sandbox_id}
 # export IRON_RESPONSE_RETRY_STATUSES=401,429
-# export IRON_RESPONSE_RETRY_HANDLER_TOKEN="$(subhub gateway iron-token)""#
+# export IRON_RESPONSE_RETRY_HANDLER_TOKEN="$(subhub gateway iron-token)""#,
+        buffered_body_bytes = crate::gateway::IRON_BUFFERED_REQUEST_BODY_BYTES,
+    )
+}
+
+fn shell_quote_value(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 pub(crate) fn doctor() -> Result<()> {
@@ -666,15 +705,41 @@ mod tests {
 
     #[test]
     fn generated_iron_config_references_tokens_without_embedding_them() {
-        let config = iron_config();
+        let config = iron_config(
+            crate::gateway::DEFAULT_LISTEN.parse().unwrap(),
+            crate::gateway::DEFAULT_IRON_GRPC_LISTEN.parse().unwrap(),
+            crate::gateway::DEFAULT_IRON_SANDBOX_ID,
+        );
         assert!(config.contains("name: grpc"));
         assert!(config.contains("target: \"127.0.0.1:7843\""));
+        assert!(config.contains(&format!(
+            "max_request_body_bytes: {}",
+            crate::gateway::IRON_BUFFERED_REQUEST_BODY_BYTES
+        )));
         assert!(config.contains("IRON_RESPONSE_RETRY_STATUSES=401,429"));
         assert!(config.contains("subhub gateway iron-token"));
-        assert!(config.contains("paths: [\"/v1/messages\"]"));
+        for provider in Provider::all() {
+            let endpoint = provider.inference_endpoint();
+            assert!(config.contains(&format!("host: \"{}\"", endpoint.host)));
+            assert!(config.contains(&format!("paths: [\"{}\"]", endpoint.path)));
+        }
         assert!(config.contains("header_allowlist is"));
         assert!(!config.contains("secret-a"));
         assert!(!config.contains("secret-b"));
+    }
+
+    #[test]
+    fn generated_iron_config_uses_custom_runtime_addresses_and_identity() {
+        let config = iron_config(
+            "127.0.0.1:8842".parse().unwrap(),
+            "127.0.0.1:8843".parse().unwrap(),
+            "sandbox with spaces",
+        );
+        assert!(config.contains("target: \"127.0.0.1:8843\""));
+        assert!(config.contains(
+            "IRON_RESPONSE_RETRY_HANDLER_URL=http://127.0.0.1:8842/_subhub/iron/retry/authorize"
+        ));
+        assert!(config.contains("IRON_RESPONSE_RETRY_HANDLER_SANDBOX_ID='sandbox with spaces'"));
     }
 
     #[test]

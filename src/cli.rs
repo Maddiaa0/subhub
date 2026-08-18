@@ -70,7 +70,7 @@ enum Commands {
         name: String,
         /// Require the credential to belong to this provider
         #[arg(long, value_enum)]
-        provider: Option<ProviderArg>,
+        provider: Option<Provider>,
     },
     /// Query subscription usage for every saved credential
     Audit {
@@ -90,7 +90,7 @@ enum GatewayCommands {
     /// Run the local credential-routing gateway
     Serve {
         /// Loopback address to listen on
-        #[arg(long, default_value = "127.0.0.1:7842")]
+        #[arg(long, default_value = gateway::DEFAULT_LISTEN)]
         listen: String,
         /// Secret Claude Code must send as ANTHROPIC_AUTH_TOKEN
         #[arg(long, env = "SUBHUB_CLIENT_TOKEN")]
@@ -105,13 +105,17 @@ enum GatewayCommands {
         #[arg(long, value_enum, default_value = "direct")]
         transport: GatewayTransportArg,
         /// Loopback address for Iron's external TransformService
-        #[arg(long, default_value = "127.0.0.1:7843")]
+        #[arg(long, default_value = gateway::DEFAULT_IRON_GRPC_LISTEN)]
         iron_grpc_listen: String,
         /// Dedicated bearer used by Iron's response-retry callbacks
         #[arg(long, env = "SUBHUB_IRON_RETRY_TOKEN")]
         iron_retry_token: Option<String>,
         /// Expected Iron sandbox identity in retry callbacks
-        #[arg(long, env = "SUBHUB_IRON_SANDBOX_ID", default_value = "local-user")]
+        #[arg(
+            long,
+            env = "SUBHUB_IRON_SANDBOX_ID",
+            default_value = gateway::DEFAULT_IRON_SANDBOX_ID
+        )]
         iron_sandbox_id: String,
         /// Internal LaunchAgent mode
         #[arg(long, hide = true)]
@@ -145,7 +149,7 @@ enum GatewayCommands {
     Status {
         /// Show credential health only for this provider
         #[arg(long, value_enum)]
-        provider: Option<ProviderArg>,
+        provider: Option<Provider>,
     },
     /// Show recent structured gateway events
     Logs {
@@ -158,7 +162,21 @@ enum GatewayCommands {
     /// Print the local gateway authentication token
     AuthToken,
     /// Print an Iron Proxy configuration fragment without embedding secrets
-    IronConfig,
+    IronConfig {
+        /// Address of Subhub's HTTP retry callback listener
+        #[arg(long, default_value = gateway::DEFAULT_LISTEN)]
+        listen: String,
+        /// Address of Subhub's external TransformService
+        #[arg(long, default_value = gateway::DEFAULT_IRON_GRPC_LISTEN)]
+        iron_grpc_listen: String,
+        /// Sandbox identity Iron sends to retry callbacks
+        #[arg(
+            long,
+            env = "SUBHUB_IRON_SANDBOX_ID",
+            default_value = gateway::DEFAULT_IRON_SANDBOX_ID
+        )]
+        iron_sandbox_id: String,
+    },
     /// Print the dedicated Iron response-retry callback token
     IronToken,
     /// Internal placeholder credential used by clients in Iron mode
@@ -167,12 +185,6 @@ enum GatewayCommands {
     /// Internal Claude Code status-line renderer
     #[command(hide = true)]
     Statusline,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum ProviderArg {
-    Claude,
-    Codex,
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -191,15 +203,6 @@ impl From<GatewayTransportArg> for gateway::GatewayTransport {
     }
 }
 
-impl From<ProviderArg> for Provider {
-    fn from(provider: ProviderArg) -> Self {
-        match provider {
-            ProviderArg::Claude => Self::Claude,
-            ProviderArg::Codex => Self::Codex,
-        }
-    }
-}
-
 pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     let path = index_path()?;
     let mut index = load_or_migrate_index(&path, &legacy_index_path()?)?;
@@ -212,7 +215,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             device_auth,
         } => add(&path, &mut index, &name, force, capture, device_auth),
         Commands::List => list(&index),
-        Commands::Set { name, provider } => set(&path, &mut index, &name, provider.map(Into::into)),
+        Commands::Set { name, provider } => set(&path, &mut index, &name, provider),
         Commands::Audit { json } => {
             let credentials = stored_credentials(&index)?;
             runtime()?.block_on(audit(credentials, json))
@@ -236,14 +239,18 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
         } => {
             retire_active_claude_credential(index)?;
             let credentials = stored_credentials(index)?;
-            let transport = gateway::GatewayTransport::from(transport);
-            let iron_retry_token = if transport == gateway::GatewayTransport::Iron {
-                Some(match iron_retry_token {
-                    Some(token) => token,
-                    None => service::ensure_iron_retry_token()?,
-                })
-            } else {
-                None
+            let mode = match gateway::GatewayTransport::from(transport) {
+                gateway::GatewayTransport::Direct => gateway::GatewayMode::Direct,
+                gateway::GatewayTransport::Iron => gateway::GatewayMode::Iron {
+                    config: gateway::IronConfig {
+                        grpc_listen: iron_grpc_listen,
+                        sandbox_id: iron_sandbox_id,
+                    },
+                    retry_token: Some(match iron_retry_token {
+                        Some(token) => token,
+                        None => service::ensure_iron_retry_token()?,
+                    }),
+                },
             };
             runtime()?.block_on(gateway::serve(gateway::ServeOptions {
                 listen,
@@ -251,10 +258,7 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
                 reserve_percent,
                 audit_interval,
                 background,
-                transport,
-                iron_grpc_listen,
-                iron_retry_token,
-                iron_sandbox_id,
+                mode,
                 initial_selected: index.active_names(),
                 credentials,
             }))
@@ -265,14 +269,24 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
         GatewayCommands::Start => service::start(),
         GatewayCommands::Stop => service::stop(),
         GatewayCommands::Restart => service::restart(),
-        GatewayCommands::Status { provider } => service::status(provider.map(Into::into)),
+        GatewayCommands::Status { provider } => service::status(provider),
         GatewayCommands::Logs { lines } => service::logs(lines),
         GatewayCommands::Doctor => service::doctor(),
         GatewayCommands::AuthToken => {
             println!("{}", service::read_gateway_token()?);
             Ok(())
         }
-        GatewayCommands::IronConfig => service::print_iron_config(),
+        GatewayCommands::IronConfig {
+            listen,
+            iron_grpc_listen,
+            iron_sandbox_id,
+        } => service::print_iron_config(
+            &listen,
+            &gateway::IronConfig {
+                grpc_listen: iron_grpc_listen,
+                sandbox_id: iron_sandbox_id,
+            },
+        ),
         GatewayCommands::IronToken => {
             println!("{}", service::ensure_iron_retry_token()?);
             Ok(())

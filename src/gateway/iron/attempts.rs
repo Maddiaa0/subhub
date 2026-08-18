@@ -118,6 +118,11 @@ impl AttemptStore {
         self.by_traceparent.len()
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.by_traceparent.clear();
+        self.traceparent_by_attempt_id.clear();
+    }
+
     fn prune(&mut self) {
         let expired: Vec<String> = self
             .by_traceparent
@@ -175,5 +180,16 @@ mod tests {
             .created_at = Instant::now() - ATTEMPT_TTL;
         assert_eq!(store.len(), 0);
         assert!(store.complete("old-attempt").is_none());
+    }
+
+    #[test]
+    fn clearing_attempts_invalidates_both_indexes() {
+        let mut store = AttemptStore::default();
+        store.insert("trace".into(), attempt());
+        assert!(store.claim_retry("trace").is_some());
+        assert!(store.authorize_retry("trace", "attempt".into(), "backup".into()));
+        store.clear();
+        assert_eq!(store.len(), 0);
+        assert!(store.complete("attempt").is_none());
     }
 }

@@ -24,6 +24,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, watch};
 
+pub(crate) const DEFAULT_LISTEN: &str = "127.0.0.1:7842";
+pub(crate) const DEFAULT_IRON_GRPC_LISTEN: &str = "127.0.0.1:7843";
+pub(crate) const DEFAULT_IRON_SANDBOX_ID: &str = "local-user";
+pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Iron buffers one extra byte so Subhub can reject oversized bodies instead
+/// of accepting a silently truncated prefix.
+pub(crate) const IRON_BUFFERED_REQUEST_BODY_BYTES: usize = MAX_REQUEST_BODY_BYTES + 1;
+const IRON_GRPC_MAX_MESSAGE_BYTES: usize = IRON_BUFFERED_REQUEST_BODY_BYTES + 2 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum GatewayTransport {
@@ -41,16 +50,45 @@ impl GatewayTransport {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct IronConfig {
+    pub grpc_listen: String,
+    pub sandbox_id: String,
+}
+
+impl Default for IronConfig {
+    fn default() -> Self {
+        Self {
+            grpc_listen: DEFAULT_IRON_GRPC_LISTEN.into(),
+            sandbox_id: DEFAULT_IRON_SANDBOX_ID.into(),
+        }
+    }
+}
+
+pub(crate) enum GatewayMode {
+    Direct,
+    Iron {
+        config: IronConfig,
+        retry_token: Option<String>,
+    },
+}
+
+impl GatewayMode {
+    fn transport(&self) -> GatewayTransport {
+        match self {
+            Self::Direct => GatewayTransport::Direct,
+            Self::Iron { .. } => GatewayTransport::Iron,
+        }
+    }
+}
+
 pub(crate) struct ServeOptions {
     pub listen: String,
     pub client_token: Option<String>,
     pub reserve_percent: f64,
     pub audit_interval: u64,
     pub background: bool,
-    pub transport: GatewayTransport,
-    pub iron_grpc_listen: String,
-    pub iron_retry_token: Option<String>,
-    pub iron_sandbox_id: String,
+    pub mode: GatewayMode,
     pub initial_selected: Vec<String>,
     pub credentials: Vec<StoredCredential>,
 }
@@ -75,11 +113,20 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
             "refusing non-loopback listen address; the MVP is local-only".into(),
         ));
     }
-    let iron_grpc_address = if options.transport == GatewayTransport::Iron {
-        let grpc_address: std::net::SocketAddr =
-            options.iron_grpc_listen.parse().map_err(|error| {
-                Error::Message(format!("invalid Iron gRPC listen address: {error}"))
-            })?;
+    let transport = options.mode.transport();
+    let iron_config = match &options.mode {
+        GatewayMode::Direct => None,
+        GatewayMode::Iron { config, .. } => Some(config.clone()),
+    };
+    let iron_grpc_address = if let Some(config) = &iron_config {
+        if config.sandbox_id.is_empty() {
+            return Err(Error::Message(
+                "Iron sandbox identity must not be empty".into(),
+            ));
+        }
+        let grpc_address: std::net::SocketAddr = config.grpc_listen.parse().map_err(|error| {
+            Error::Message(format!("invalid Iron gRPC listen address: {error}"))
+        })?;
         if !grpc_address.ip().is_loopback() {
             return Err(Error::Message(
                 "refusing non-loopback Iron gRPC listen address; local mode is loopback-only"
@@ -126,9 +173,8 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         }
     }
     let refresh_backoff = persisted_refresh_backoffs(&options.credentials);
-    let iron_retry_token = if options.transport == GatewayTransport::Iron {
-        let token = options
-            .iron_retry_token
+    let iron_retry_token = if let GatewayMode::Iron { retry_token, .. } = options.mode {
+        let token = retry_token
             .or_else(|| service::read_iron_retry_token().ok())
             .filter(|token| !token.is_empty())
             .ok_or_else(|| {
@@ -151,10 +197,15 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         refresh_backoff: Arc::new(Mutex::new(refresh_backoff)),
         client_token: Arc::new(client_token.clone()),
         reserve_percent: options.reserve_percent,
-        transport: options.transport,
+        transport,
         iron_attempts: Arc::default(),
         iron_retry_token,
-        iron_sandbox_id: Arc::new(options.iron_sandbox_id),
+        iron_sandbox_id: Arc::new(
+            iron_config
+                .as_ref()
+                .map(|config| config.sandbox_id.clone())
+                .unwrap_or_default(),
+        ),
     };
     let audit_state = state.clone();
     let interval = options.audit_interval.max(30);
@@ -184,7 +235,7 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
             "/_subhub/reload",
             axum::routing::post(routes::reload_accounts),
         );
-    let app = match options.transport {
+    let app = match transport {
         GatewayTransport::Direct => app.route("/{*path}", any(routes::proxy)),
         GatewayTransport::Iron => app
             .route(
@@ -204,9 +255,9 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
     if !options.background {
         println!(
             "subhub {} gateway listening on http://{address}",
-            options.transport.name()
+            transport.name()
         );
-        if options.transport == GatewayTransport::Direct {
+        if transport == GatewayTransport::Direct {
             println!("export ANTHROPIC_BASE_URL=http://{address}");
             println!("export ANTHROPIC_AUTH_TOKEN={client_token}");
         } else {
@@ -214,11 +265,18 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
                 "Iron TransformService listening on {}",
                 iron_grpc_address.expect("Iron mode validates its gRPC listener")
             );
-            println!("Run `subhub gateway iron-config` for the matching Iron configuration.");
+            let config = iron_config
+                .as_ref()
+                .expect("Iron mode retains its configuration");
+            println!(
+                "Run `subhub gateway iron-config --listen {address} --iron-grpc-listen {} --iron-sandbox-id {}` for the matching Iron configuration.",
+                config.grpc_listen,
+                shell_quote_argument(&config.sandbox_id)
+            );
         }
         println!("Press Ctrl-C to stop.");
     }
-    if options.transport == GatewayTransport::Iron {
+    if transport == GatewayTransport::Iron {
         serve_iron(
             listener,
             app,
@@ -236,6 +294,10 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
     }
 }
 
+fn shell_quote_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 async fn serve_iron(
     listener: tokio::net::TcpListener,
     app: Router,
@@ -248,7 +310,10 @@ async fn serve_iron(
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
         .into_future();
     let grpc = tonic::transport::Server::builder()
-        .add_service(TransformServiceServer::new(iron::IronTransform::new(state)))
+        .add_service(
+            TransformServiceServer::new(iron::IronTransform::new(state))
+                .max_decoding_message_size(IRON_GRPC_MAX_MESSAGE_BYTES),
+        )
         .serve_with_shutdown(grpc_address, wait_for_shutdown(shutdown_rx));
     tokio::pin!(http);
     tokio::pin!(grpc);

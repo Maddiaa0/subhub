@@ -80,10 +80,11 @@ The CLI's `gateway status` / `doctor` / `statusline` read the gateway's
 
 ## Extending
 
-To add a provider: add a `Provider` variant and follow the compiler through
-the exhaustive matches (`provider.rs` first, then the usage-fetch dispatch in
-`gateway/audit.rs` and `cli.rs`, and the vault payload shape in
-`credentials/mod.rs`).
+To add a provider: add a `Provider` variant and its `InferenceEndpoint`, then
+follow the compiler through the exhaustive matches (`provider.rs` first, then
+the usage-fetch dispatch in `gateway/audit.rs` and `cli.rs`, and the vault
+payload shape in `credentials/mod.rs`). Iron target validation and generated
+allowlist/gRPC rules both consume the shared endpoint descriptor.
 
 ## Testing
 

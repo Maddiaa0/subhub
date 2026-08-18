@@ -4,6 +4,7 @@ use super::proto::{
     HeaderValues, HttpRequest, HttpResponse, TransformAction, TransformRequestRequest,
     TransformRequestResponse, TransformResponseRequest, TransformResponseResponse,
 };
+use crate::gateway::MAX_REQUEST_BODY_BYTES;
 use crate::gateway::routing::{apply_credential_headers, request_model, select_initial};
 use crate::gateway::state::ProxyState;
 use crate::provider::Provider;
@@ -40,7 +41,7 @@ impl TransformService for IronTransform {
         request: Request<TransformRequestRequest>,
     ) -> std::result::Result<Response<TransformRequestResponse>, Status> {
         let input = request.into_inner();
-        let Some(mut original) = input.request else {
+        let Some(original) = input.request else {
             return Ok(Response::new(reject(
                 StatusCode::BAD_REQUEST,
                 "Iron transform request did not contain an HTTP request",
@@ -52,6 +53,12 @@ impl TransformService for IronTransform {
                 return Ok(Response::new(reject(StatusCode::FORBIDDEN, &message)));
             }
         };
+        if request_body_is_oversized_or_truncated(&original) {
+            return Ok(Response::new(reject(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds Subhub's 32 MiB inference limit",
+            )));
+        }
         let model = request_model(&original.body);
         let credential = match select_initial(&self.state, target.provider, model.as_deref()).await
         {
@@ -84,7 +91,10 @@ impl TransformService for IronTransform {
             TRACEPARENT,
             HeaderValue::from_str(&traceparent).expect("generated traceparent is valid"),
         );
-        original.headers = http_headers_to_proto(&headers);
+        let modified_request = HttpRequest {
+            headers: http_headers_to_proto(&headers),
+            ..Default::default()
+        };
         self.state.iron_attempts.lock().await.insert(
             traceparent.clone(),
             Attempt::new(
@@ -107,7 +117,9 @@ impl TransformService for IronTransform {
         Ok(Response::new(TransformRequestResponse {
             action: TransformAction::Continue as i32,
             response: None,
-            modified_request: Some(original),
+            // Return only the field Subhub owns. Echoing Iron's bounded body
+            // view here would turn a truncated prefix into a replacement body.
+            modified_request: Some(modified_request),
             annotations: HashMap::from([
                 ("provider".into(), target.provider.name().into()),
                 ("selected_credential".into(), credential.name),
@@ -157,9 +169,6 @@ impl Target {
         context: Option<&super::proto::TransformContext>,
         request: &HttpRequest,
     ) -> std::result::Result<Self, String> {
-        if !request.method.eq_ignore_ascii_case("POST") {
-            return Err("Subhub only authorizes POST requests to provider inference APIs".into());
-        }
         let host = normalize_https_host(&request.host)
             .ok_or_else(|| "Iron request used an unsupported host or port".to_string())?;
         let sni = context
@@ -170,18 +179,24 @@ impl Target {
         }
         let path = request_target(&request.url, &host)?;
         let route_path = path.split('?').next().unwrap_or(path.as_str());
-        let provider = match (host.as_str(), route_path) {
-            ("api.anthropic.com", "/v1/messages") => Provider::Claude,
-            ("chatgpt.com", "/backend-api/codex/responses") => Provider::Codex,
-            _ => return Err("request is not an approved Subhub provider endpoint".into()),
-        };
+        let provider = Provider::from_inference_endpoint(&host, &request.method, route_path)
+            .ok_or_else(|| "request is not an approved Subhub provider endpoint".to_string())?;
         Ok(Self {
             provider,
             host,
-            method: "POST".into(),
+            method: request.method.to_ascii_uppercase(),
             path,
         })
     }
+}
+
+fn request_body_is_oversized_or_truncated(request: &HttpRequest) -> bool {
+    if request.body.len() > MAX_REQUEST_BODY_BYTES {
+        return true;
+    }
+    proto_header(&request.headers, "content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|declared| declared > request.body.len())
 }
 
 fn normalize_https_host(authority: &str) -> Option<String> {
@@ -379,6 +394,10 @@ mod tests {
             .into_inner();
         assert_eq!(response.action, TransformAction::Continue as i32);
         let modified = response.modified_request.unwrap();
+        assert!(modified.method.is_empty());
+        assert!(modified.url.is_empty());
+        assert!(modified.host.is_empty());
+        assert!(modified.body.is_empty());
         assert_eq!(
             proto_header(&modified.headers, "authorization").as_deref(),
             Some("Bearer secret-b")
@@ -405,6 +424,27 @@ mod tests {
             .into_inner();
         assert_eq!(response.action, TransformAction::Reject as i32);
         assert_eq!(response.response.unwrap().status_code, 403);
+    }
+
+    #[tokio::test]
+    async fn request_transform_rejects_a_body_truncated_by_iron() {
+        let state = test_state();
+        let service = IronTransform::new(state.clone());
+        let mut request = claude_request();
+        request.request.as_mut().unwrap().headers.insert(
+            "content-length".into(),
+            HeaderValues {
+                values: vec![(MAX_REQUEST_BODY_BYTES + 1).to_string()],
+            },
+        );
+        let response = service
+            .transform_request(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.action, TransformAction::Reject as i32);
+        assert_eq!(response.response.unwrap().status_code, 413);
+        assert_eq!(state.iron_attempts.lock().await.len(), 0);
     }
 
     #[tokio::test]

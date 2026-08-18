@@ -93,7 +93,9 @@ pub(crate) async fn authorize(
         };
         attempt
     };
-    let Some(initial) = credential_by_name(&state, &attempt.credential_name).await else {
+    let Some(initial) =
+        credential_by_name(&state, &attempt.credential_name, attempt.provider).await
+    else {
         return decision_response(None, None);
     };
     let selected = if status == StatusCode::TOO_MANY_REQUESTS {
@@ -118,6 +120,9 @@ pub(crate) async fn authorize(
     let Some(selected) = selected else {
         return decision_response(None, None);
     };
+    if selected.provider != attempt.provider {
+        return decision_response(None, None);
+    }
     let overrides = match retry_header_overrides(&selected) {
         Ok(headers) => headers,
         Err(_) => return decision_response(None, None),
@@ -171,7 +176,8 @@ pub(crate) async fn complete(
     if let Some(attempt) = attempt {
         if matches!(request.replay_status, Some(401 | 429))
             && let Some(retry_name) = &attempt.retry_credential_name
-            && let Some(retry_credential) = credential_by_name(&state, retry_name).await
+            && let Some(retry_credential) =
+                credential_by_name(&state, retry_name, attempt.provider).await
         {
             let status = StatusCode::from_u16(request.replay_status.unwrap())
                 .expect("401 and 429 are valid HTTP status codes");
@@ -227,13 +233,17 @@ fn normalize_host(authority: &str) -> Option<String> {
     }
 }
 
-async fn credential_by_name(state: &ProxyState, name: &str) -> Option<StoredCredential> {
+async fn credential_by_name(
+    state: &ProxyState,
+    name: &str,
+    provider: Provider,
+) -> Option<StoredCredential> {
     state
         .credentials
         .read()
         .await
         .iter()
-        .find(|credential| credential.name == name)
+        .find(|credential| credential.name == name && credential.provider == provider)
         .cloned()
 }
 
@@ -399,6 +409,42 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn retry_refuses_a_same_name_credential_from_another_provider() {
+        let state = test_state();
+        let traceparent = seed_attempt(&state).await;
+        let mut credentials = state.credentials.write().await;
+        let replaced = credentials
+            .iter_mut()
+            .find(|credential| credential.name == "full")
+            .unwrap();
+        replaced.provider = Provider::Codex;
+        replaced.access_token = "codex-secret".into();
+        replaced.account_id = Some("codex-account".into());
+        drop(credentials);
+
+        let response = authorize(
+            State(state),
+            auth_headers(),
+            Json(DecisionRequest {
+                scheme: "https".into(),
+                host: "api.anthropic.com".into(),
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                replayable: true,
+                status: 429,
+                response_headers: HashMap::new(),
+                sandbox_id: "local-user".into(),
+                traceparent,
+            }),
+        )
+        .await;
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let decision: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decision["retry"], false);
+        assert!(decision["headers"].as_object().unwrap().is_empty());
     }
 
     #[tokio::test]

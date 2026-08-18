@@ -1,6 +1,7 @@
 //! HTTP handlers: the admin endpoints (`/_subhub/*`) and the forwarding
 //! proxy, including the 401/429 retry-with-another-credential paths.
 
+use super::MAX_REQUEST_BODY_BYTES;
 use super::audit::audit_all;
 use super::protocol::{CredentialReport, GatewayStatus, SelectedReport, TokenState};
 use super::refresh::REFRESH_MARGIN_MS;
@@ -73,6 +74,9 @@ pub(super) async fn reload_accounts(
     // with request handlers that hold another of these locks.
     let refresh_backoff = persisted_refresh_backoffs(&loaded);
     *state.credentials.write().await = loaded;
+    // Attempts refer to a specific in-memory credential snapshot. A same-name
+    // replacement must never inherit authorization from the prior snapshot.
+    state.iron_attempts.lock().await.clear();
     *state.refresh_backoff.lock().await = refresh_backoff;
     state.refresh_locks.lock().await.clear();
     state
@@ -137,7 +141,7 @@ pub(super) async fn proxy(State(state): State<ProxyState>, request: Request) -> 
     }
     let (parts, body) = request.into_parts();
     let provider = Provider::from_request_path(parts.uri.path());
-    let bytes = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
+    let bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(error) => {
             return error_response(
