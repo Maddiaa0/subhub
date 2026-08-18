@@ -15,11 +15,12 @@ use std::process::Command;
 use std::time::Duration;
 
 pub(crate) const CLAUDE_OAUTH_SCOPES_ENV: &str = "CLAUDE_CODE_OAUTH_SCOPES";
-pub(crate) const REQUESTED_OAUTH_SCOPES: [&str; 4] = [
+pub(crate) const REQUESTED_OAUTH_SCOPES: [&str; 5] = [
     "user:inference",
     "user:profile",
     "user:sessions:claude_code",
     "user:mcp_servers",
+    "user:file_upload",
 ];
 const REQUIRED_OAUTH_SCOPES: [&str; 2] = ["user:inference", "user:profile"];
 
@@ -184,14 +185,6 @@ async fn request_claude_refresh(
 ) -> Result<ClaudeRefreshResponse> {
     let response = client
         .post(token_url)
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .header(
-            "user-agent",
-            format!(
-                "claude-code/{}",
-                claude_version().as_deref().unwrap_or("2.1.0")
-            ),
-        )
         .json(&serde_json::json!({
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
@@ -207,11 +200,26 @@ async fn request_claude_refresh(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        if let Some(detail) = oauth_error_detail(&body) {
-            return Err(Error::refresh_terminal(format!(
-                "Claude OAuth refresh returned {status}: {}",
-                detail.chars().take(300).collect::<String>()
-            )));
+        let oauth_error = oauth_error_fields(&body);
+        let detail = oauth_error
+            .as_ref()
+            .map(|(code, description)| {
+                description.as_ref().map_or_else(
+                    || code.clone(),
+                    |description| format!("{code}: {description}"),
+                )
+            })
+            .unwrap_or_else(|| body.clone());
+        let message = format!(
+            "Claude OAuth refresh returned {status}: {}",
+            detail.chars().take(300).collect::<String>()
+        );
+        if refresh_failure_is_transient(status, oauth_error.as_ref().map(|(code, _)| code.as_str()))
+        {
+            return Err(Error::refresh_transient(message));
+        }
+        if oauth_error.is_some() {
+            return Err(Error::refresh_terminal(message));
         }
         if status.is_client_error()
             && status != reqwest::StatusCode::REQUEST_TIMEOUT
@@ -238,18 +246,26 @@ async fn request_claude_refresh(
     Ok(refreshed)
 }
 
-fn oauth_error_detail(body: &str) -> Option<String> {
+fn refresh_failure_is_transient(status: reqwest::StatusCode, oauth_code: Option<&str>) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || matches!(
+            oauth_code,
+            Some("server_error" | "temporarily_unavailable" | "rate_limit_error")
+        )
+}
+
+fn oauth_error_fields(body: &str) -> Option<(String, Option<String>)> {
     let value: Value = serde_json::from_str(body).ok()?;
     let error = value.get("error")?;
     if let Some(code) = error.as_str().filter(|code| !code.is_empty()) {
         let description = value
             .get("error_description")
             .and_then(Value::as_str)
-            .filter(|description| !description.is_empty());
-        return Some(description.map_or_else(
-            || code.to_owned(),
-            |description| format!("{code}: {description}"),
-        ));
+            .filter(|description| !description.is_empty())
+            .map(str::to_owned);
+        return Some((code.to_owned(), description));
     }
     let error = error.as_object()?;
     let code = ["type", "code", "error"]
@@ -259,11 +275,19 @@ fn oauth_error_detail(body: &str) -> Option<String> {
     let description = ["message", "description", "error_description"]
         .into_iter()
         .find_map(|key| error.get(key).and_then(Value::as_str))
-        .filter(|description| !description.is_empty());
-    Some(description.map_or_else(
-        || code.to_owned(),
-        |description| format!("{code}: {description}"),
-    ))
+        .filter(|description| !description.is_empty())
+        .map(str::to_owned);
+    Some((code.to_owned(), description))
+}
+
+#[cfg(test)]
+fn oauth_error_detail(body: &str) -> Option<String> {
+    oauth_error_fields(body).map(|(code, description)| {
+        description.map_or_else(
+            || code.clone(),
+            |description| format!("{code}: {description}"),
+        )
+    })
 }
 
 pub(crate) fn claude_version() -> Option<String> {
@@ -417,14 +441,14 @@ mod tests {
         assert_eq!(body["refresh_token"], "old-refresh");
         assert_eq!(body["client_id"], "stored-client");
         assert_eq!(body["scope"], "user:inference user:profile");
-        assert_eq!(headers["anthropic-beta"], "oauth-2025-04-20");
+        assert!(!headers.contains_key("anthropic-beta"));
         assert_eq!(refreshed.access_token, "new-access");
         assert_eq!(refreshed.refresh_token.as_deref(), Some("new-refresh"));
         assert_eq!(refreshed.expires_in, 3600);
     }
 
     #[tokio::test]
-    async fn oauth_error_is_terminal_but_bodyless_provider_failure_is_retryable() {
+    async fn invalid_grant_is_terminal_but_provider_failures_are_retryable() {
         let (url, _) = refresh_server_with_status(
             axum::http::StatusCode::BAD_REQUEST,
             serde_json::json!({
@@ -453,6 +477,34 @@ mod tests {
             Some("invalid_grant: token reused")
         );
 
+        for (status, response) in [
+            (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                serde_json::json!({
+                    "error": {"type": "rate_limit_error", "message": "try later"}
+                }),
+            ),
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({
+                    "error": "temporarily_unavailable",
+                    "error_description": "maintenance"
+                }),
+            ),
+        ] {
+            let (url, _) = refresh_server_with_status(status, response).await;
+            let error = request_claude_refresh(
+                &reqwest::Client::new(),
+                &url,
+                "old-refresh",
+                CLAUDE_CLIENT_ID,
+                "user:inference",
+            )
+            .await
+            .unwrap_err();
+            assert!(!error.refresh_is_terminal());
+        }
+
         let (url, _) = refresh_server_with_status(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             serde_json::json!({"message": "temporarily unavailable"}),
@@ -476,7 +528,7 @@ mod tests {
             requested_oauth_scopes(Some(std::ffi::OsStr::new("custom:scope user:profile")));
         assert_eq!(
             scopes,
-            "custom:scope user:profile user:inference user:sessions:claude_code user:mcp_servers"
+            "custom:scope user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
         );
     }
 
