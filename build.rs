@@ -7,9 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let includes = [PathBuf::from("proto/iron"), protobuf_include];
     let mut prost = tonic_prost_build::Config::new();
     prost.protoc_executable(protoc);
-    tonic_prost_build::configure()
-        .build_client(false)
-        .compile_with_config(prost, &[proto], &includes)?;
+    tonic_prost_build::configure().compile_with_config(prost, &[proto], &includes)?;
     println!("cargo:rerun-if-changed=proto/iron/transform/v1/transform.proto");
     Ok(())
 }

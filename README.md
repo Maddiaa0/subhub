@@ -138,8 +138,15 @@ The default local layout is:
 
 ```text
 127.0.0.1:7842  Subhub admin and authenticated Iron retry callbacks
-127.0.0.1:7843  Subhub TransformService (plaintext gRPC)
+127.0.0.1:7843  Subhub TransformService (mutually authenticated TLS)
 ```
+
+Subhub automatically provisions a dedicated local CA plus server and Iron
+client identities under its private configuration directory. Both the Iron
+`gateway serve` mode and `gateway iron-config` create the same stable material
+when needed; the generated YAML contains file paths, never private key
+contents. If Iron runs in a container, mount the `iron-tls` directory at the
+same absolute path read-only so Iron can load the generated client files.
 
 Only `POST https://api.anthropic.com/v1/messages` and
 `POST https://chatgpt.com/backend-api/codex/responses` can receive credentials.
@@ -151,14 +158,19 @@ specific Claude Code and Codex versions in use.
 Subhub accepts inference request bodies up to 32 MiB in either transport.
 The generated Iron configuration buffers one additional byte so oversized
 requests are rejected with `413` instead of forwarding a truncated prefix.
+Iron does not send upstream response bodies to Subhub. In the pinned release,
+the request-body option applies to both transform phases, so the buffered
+prompt is included again with the response headers. This preserves model-aware
+routing and bounded-body validation; it is an extra loopback copy rather than
+an upstream transfer.
 When using custom listener addresses or a custom sandbox ID, pass the same
 values to both `gateway serve` and `gateway iron-config`.
 
 The sandbox must trust Iron's MITM CA. Iron validates the providers' public
-certificates normally. Iron-to-Subhub traffic is plaintext loopback, so this
-local mode introduces no second CA. If Iron runs in a separate container,
-`127.0.0.1` refers to that container; use a shared network namespace (for
-example host networking on Linux) rather than exposing Subhub's control ports.
+certificates normally. Iron validates Subhub's separate local CA and presents
+the generated client certificate on every transform call. If Iron runs in a
+separate container, `127.0.0.1` refers to that container; use a shared network
+namespace rather than exposing Subhub's control ports.
 
 Iron may ask Subhub for one exact replay when the provider returns `401` or
 `429` and the complete request body fits Iron's configured buffer. A `429`

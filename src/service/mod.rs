@@ -353,9 +353,10 @@ pub(crate) fn print_iron_config(listen: &str, iron: &crate::gateway::IronConfig)
     }
     ensure_iron_proxy_token()?;
     ensure_iron_retry_token()?;
+    let tls = crate::gateway::ensure_iron_tls(grpc_address.ip())?;
     println!(
         "{}",
-        iron_config(callback_address, grpc_address, &iron.sandbox_id)
+        iron_config(callback_address, grpc_address, &iron.sandbox_id, &tls)
     );
     Ok(())
 }
@@ -376,6 +377,7 @@ fn iron_config(
     callback_address: std::net::SocketAddr,
     grpc_address: std::net::SocketAddr,
     sandbox_id: &str,
+    tls: &crate::gateway::IronTlsPaths,
 ) -> String {
     let mut allowlist_rules = String::new();
     let mut grpc_rules = String::new();
@@ -391,9 +393,13 @@ fn iron_config(
         ));
     }
     let sandbox_id = shell_quote_value(sandbox_id);
+    let ca_cert = yaml_path(&tls.ca_cert);
+    let client_cert = yaml_path(&tls.client_cert);
+    let client_key = yaml_path(&tls.client_key);
     format!(
         r#"# Merge this fragment into iron-proxy's configuration.
-# SubHub remains on loopback; only the sandbox needs to trust Iron's MITM CA.
+# SubHub remains on loopback and provisions the dedicated gRPC mTLS files
+# referenced below. The sandbox only needs to trust Iron's separate MITM CA.
 proxy:
   # One byte above SubHub's accepted limit lets the transform reject an
   # oversized request instead of forwarding a silently truncated prefix.
@@ -413,6 +419,11 @@ transforms:
       target: "{grpc_address}"
       send_request_body: true
       send_response_body: false
+      tls:
+        enabled: true
+        ca_cert: {ca_cert}
+        cert: {client_cert}
+        key: {client_key}
       rules:
 {grpc_rules}
 # SubHub replaces Authorization and x-api-key itself. A header_allowlist is
@@ -436,6 +447,10 @@ transforms:
 
 fn shell_quote_value(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn yaml_path(path: &Path) -> String {
+    serde_json::to_string(&path.to_string_lossy()).expect("a path string serializes as JSON")
 }
 
 pub(crate) fn doctor() -> Result<()> {
@@ -537,6 +552,7 @@ fn purge_data() -> Result<()> {
     let _ = credential_delete(GATEWAY_SERVICE, GATEWAY_TOKEN_ACCOUNT);
     let _ = credential_delete(GATEWAY_SERVICE, IRON_PROXY_TOKEN_ACCOUNT);
     let _ = credential_delete(GATEWAY_SERVICE, IRON_RETRY_TOKEN_ACCOUNT);
+    crate::gateway::purge_iron_tls()?;
     Ok(())
 }
 
@@ -635,6 +651,10 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn iron_tls_paths() -> crate::gateway::IronTlsPaths {
+        crate::gateway::IronTlsPaths::in_directory(Path::new("/tmp/subhub/iron-tls"))
+    }
+
     #[test]
     fn shell_quoting_handles_special_paths() {
         assert_eq!(
@@ -709,6 +729,7 @@ mod tests {
             crate::gateway::DEFAULT_LISTEN.parse().unwrap(),
             crate::gateway::DEFAULT_IRON_GRPC_LISTEN.parse().unwrap(),
             crate::gateway::DEFAULT_IRON_SANDBOX_ID,
+            &iron_tls_paths(),
         );
         assert!(config.contains("name: grpc"));
         assert!(config.contains("target: \"127.0.0.1:7843\""));
@@ -718,6 +739,10 @@ mod tests {
         )));
         assert!(config.contains("IRON_RESPONSE_RETRY_STATUSES=401,429"));
         assert!(config.contains("subhub gateway iron-token"));
+        assert!(config.contains("enabled: true"));
+        assert!(config.contains("ca_cert: \"/tmp/subhub/iron-tls/ca.pem\""));
+        assert!(config.contains("cert: \"/tmp/subhub/iron-tls/iron-client.pem\""));
+        assert!(config.contains("key: \"/tmp/subhub/iron-tls/iron-client-key.pem\""));
         for provider in Provider::all() {
             let endpoint = provider.inference_endpoint();
             assert!(config.contains(&format!("host: \"{}\"", endpoint.host)));
@@ -734,6 +759,7 @@ mod tests {
             "127.0.0.1:8842".parse().unwrap(),
             "127.0.0.1:8843".parse().unwrap(),
             "sandbox with spaces",
+            &iron_tls_paths(),
         );
         assert!(config.contains("target: \"127.0.0.1:8843\""));
         assert!(config.contains(

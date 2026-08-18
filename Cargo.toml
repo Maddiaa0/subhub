@@ -25,6 +25,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 fs2 = "0.4"
 rand = "0.9"
+rcgen = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 prost = "0.14"
 prost-types = "0.14"
@@ -33,8 +34,11 @@ serde_json = "1.0"
 thiserror = "2"
 toml_edit = "0.23"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "transport"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "tls-ring", "transport"] }
 tonic-prost = "0.14"
+
+[dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3.2"

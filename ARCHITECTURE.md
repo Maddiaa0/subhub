@@ -62,7 +62,8 @@ The CLI's `gateway status` / `doctor` / `statusline` read the gateway's
   account identities are rejected.
 - **Loopback only.** The gateway refuses non-loopback listen addresses; admin
   endpoints require the local bearer token, and Iron retry callbacks require a
-  different dedicated token.
+  different dedicated token. Iron's transform client must additionally present
+  the automatically provisioned client certificate over mTLS.
 - **Iron cannot redirect.** The external transform issues credentials only for
   the exact Anthropic and Codex inference host/method/path combinations. Retry
   authorization must match the original trace, sandbox, scheme, authority,

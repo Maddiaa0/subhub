@@ -11,6 +11,8 @@ mod routing;
 mod selection;
 mod state;
 
+pub(crate) use iron::{IronTlsPaths, ensure_iron_tls, purge_iron_tls};
+
 use crate::provider::StoredCredential;
 use crate::usage::UsageClient;
 use crate::{Error, Result, claude_version, service};
@@ -142,6 +144,9 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
     } else {
         None
     };
+    let iron_tls = iron_grpc_address
+        .map(|address| ensure_iron_tls(address.ip()))
+        .transpose()?;
 
     let client_token = match options
         .client_token
@@ -281,6 +286,7 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
             listener,
             app,
             iron_grpc_address.expect("Iron mode validates its gRPC listener"),
+            iron_tls.expect("Iron mode provisions its gRPC identity"),
             state,
         )
         .await
@@ -302,6 +308,7 @@ async fn serve_iron(
     listener: tokio::net::TcpListener,
     app: Router,
     grpc_address: std::net::SocketAddr,
+    tls: IronTlsPaths,
     state: ProxyState,
 ) -> Result<()> {
     use iron::proto::transform_service_server::TransformServiceServer;
@@ -310,6 +317,8 @@ async fn serve_iron(
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
         .into_future();
     let grpc = tonic::transport::Server::builder()
+        .tls_config(tls.server_config()?)
+        .map_err(|error| Error::Message(format!("invalid Iron gRPC TLS identity: {error}")))?
         .add_service(
             TransformServiceServer::new(iron::IronTransform::new(state))
                 .max_decoding_message_size(IRON_GRPC_MAX_MESSAGE_BYTES),

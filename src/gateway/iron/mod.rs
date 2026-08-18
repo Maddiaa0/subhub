@@ -3,9 +3,11 @@
 
 mod attempts;
 pub(super) mod retry;
+mod tls;
 mod transform;
 
 pub(super) use attempts::AttemptStore;
+pub(crate) use tls::{IronTlsPaths, ensure_iron_tls, purge_iron_tls};
 pub(super) use transform::IronTransform;
 
 pub(super) mod proto {
