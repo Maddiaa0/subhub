@@ -26,6 +26,7 @@ pub(crate) struct ServeOptions {
     pub reserve_percent: f64,
     pub audit_interval: u64,
     pub background: bool,
+    pub allow_remote: bool,
     pub initial_selected: Vec<String>,
     pub credentials: Vec<StoredCredential>,
 }
@@ -45,9 +46,10 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         .listen
         .parse()
         .map_err(|error| Error::Message(format!("invalid listen address: {error}")))?;
-    if !address.ip().is_loopback() {
+    if !address.ip().is_loopback() && !options.allow_remote {
         return Err(Error::Message(
-            "refusing non-loopback listen address; the MVP is local-only".into(),
+            "refusing non-loopback listen address; pass --allow-remote to serve beyond this host"
+                .into(),
         ));
     }
 
@@ -55,10 +57,20 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         .client_token
         .or_else(|| service::read_gateway_token().ok())
     {
+        Some(token) if !address.ip().is_loopback() && token.is_empty() => {
+            return Err(Error::Message(
+                "remote listen requires a non-empty client token".into(),
+            ));
+        }
         Some(token) => token,
         None if options.background => {
             return Err(Error::Message(
                 "background gateway token is missing; run `subhub gateway install` again".into(),
+            ));
+        }
+        None if !address.ip().is_loopback() => {
+            return Err(Error::Message(
+                "remote listen requires an explicit client token; pass --client-token or set SUBHUB_CLIENT_TOKEN".into(),
             ));
         }
         None => Alphanumeric.sample_string(&mut rand::rng(), 32),

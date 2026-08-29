@@ -70,7 +70,10 @@ subhub gateway auth-token         Print the local gateway token
 
 ## How it works
 
-The authenticated gateway listens only on `127.0.0.1:7842`. It audits account
+The authenticated gateway listens on `127.0.0.1:7842` by default. Serving
+beyond the host (for example in a container or Kubernetes cluster) requires
+`--allow-remote` together with an explicit client token; see `deploy/README.md`
+for a container image and manifest. It audits account
 capacity every two minutes and keeps using the selected credential while it is
 available. A pre-stream `401` or `429` may be retried once with another eligible
 credential; interrupted streams are never replayed.

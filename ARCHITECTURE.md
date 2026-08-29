@@ -55,8 +55,9 @@ The CLI's `gateway status` / `doctor` / `statusline` read the gateway's
   after capture. The gateway holds a cross-process owner lease from its final
   vault read through atomic persistence of the rotated token; duplicate Claude
   account identities are rejected.
-- **Loopback only.** The gateway refuses non-loopback listen addresses; admin
-  endpoints require the local bearer token.
+- **Loopback by default.** The gateway refuses non-loopback listen addresses
+  unless `--allow-remote` is passed with an explicit, non-empty client token;
+  admin endpoints always require the bearer token.
 - **Audits are advisory.** A transient audit failure must not make a working
   credential unroutable; fatal audit errors must (see `ErrorKind`).
 - **Install is surgical.** `service` records exactly what it changed in

@@ -104,6 +104,9 @@ enum GatewayCommands {
         /// Internal LaunchAgent mode
         #[arg(long, hide = true)]
         background: bool,
+        /// Serve on a non-loopback address; requires an explicit client token
+        #[arg(long)]
+        allow_remote: bool,
     },
     /// Install and start the background gateway
     Install,
@@ -186,6 +189,7 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
             reserve_percent,
             audit_interval,
             background,
+            allow_remote,
         } => {
             retire_active_claude_credential(index)?;
             let credentials = stored_credentials(index)?;
@@ -195,6 +199,7 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
                 reserve_percent,
                 audit_interval,
                 background,
+                allow_remote,
                 initial_selected: index.active_names(),
                 credentials,
             }))
