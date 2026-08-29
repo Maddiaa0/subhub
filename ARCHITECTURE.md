@@ -58,6 +58,9 @@ The CLI's `gateway status` / `doctor` / `statusline` read the gateway's
 - **Loopback by default.** The gateway refuses non-loopback listen addresses
   unless `--allow-remote` is passed with an explicit, non-empty client token;
   admin endpoints always require the bearer token.
+- **Writes need the admin token.** The credential-push endpoint only exists
+  when a distinct `--admin-token` is configured; the client token can read
+  status and route requests but never write credentials.
 - **Audits are advisory.** A transient audit failure must not make a working
   credential unroutable; fatal audit errors must (see `ErrorKind`).
 - **Install is surgical.** `service` records exactly what it changed in

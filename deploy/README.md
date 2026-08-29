@@ -23,26 +23,35 @@ Or let the `docker.yml` GitHub Actions workflow publish to GHCR on pushes to
 kubectl create namespace subhub
 kubectl create secret generic subhub-client-token -n subhub \
   --from-literal=token="$(openssl rand -hex 32)"
+kubectl create secret generic subhub-admin-token -n subhub \
+  --from-literal=token="$(openssl rand -hex 32)"
 kubectl apply -f deploy/kubernetes.yaml
 ```
 
-The pod will crash-loop with `no credentials saved` until the volume is
-seeded — that is expected on first deploy.
+With `SUBHUB_ADMIN_TOKEN` set the gateway starts with an empty volume and
+waits to be seeded over its admin API.
 
 ## Seed credentials
 
 `subhub add` needs the `claude`/`codex` CLIs and a browser, so capture
-accounts on a workstation, then copy the store onto the PVC:
+accounts on a workstation, then push each one to the remote gateway
+(`kubectl port-forward` tunnels through the API server over TLS):
 
 ```sh
 # on the workstation: accounts already saved via `subhub add`
-kubectl scale deploy/subhub -n subhub --replicas=0
-kubectl run subhub-seed -n subhub --image=busybox --restart=Never \
-  --overrides='{"spec":{"securityContext":{"runAsUser":10001,"fsGroup":10001},"containers":[{"name":"subhub-seed","image":"busybox","command":["sleep","3600"],"volumeMounts":[{"name":"data","mountPath":"/data"}]}],"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"subhub-data"}}]}}'
-kubectl cp ~/.config/subhub subhub/subhub-seed:/data/subhub
-kubectl delete pod subhub-seed -n subhub
-kubectl scale deploy/subhub -n subhub --replicas=1
+kubectl port-forward -n subhub svc/subhub 7842:7842 &
+export SUBHUB_ADMIN_TOKEN=$(kubectl get secret subhub-admin-token -n subhub -o jsonpath='{.data.token}' | base64 -d)
+subhub push personal --remote http://127.0.0.1:7842
+subhub push work --remote http://127.0.0.1:7842
 ```
+
+Each push validates, persists, and reloads on the remote — the credential is
+routable as soon as the command returns. Pushing an existing name replaces
+it. The admin token is the only credential that can write; the client token
+handed to workloads is deliberately rejected by this API.
+
+(Alternative: copy `~/.config/subhub` onto the PVC by hand with a helper pod
+and `kubectl cp` — useful when the workstation cannot reach the cluster API.)
 
 **One owner per refresh-token family.** The gateway rotates Claude refresh
 tokens; two gateways sharing an account (your laptop's and the cluster's)

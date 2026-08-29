@@ -27,12 +27,15 @@ pub(crate) struct ServeOptions {
     pub audit_interval: u64,
     pub background: bool,
     pub allow_remote: bool,
+    pub admin_token: Option<String>,
     pub initial_selected: Vec<String>,
     pub credentials: Vec<StoredCredential>,
 }
 
 pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
-    if options.credentials.is_empty() {
+    // With an admin token the gateway may start empty and be seeded over
+    // `PUT /_subhub/credentials/{name}` (e.g. a fresh cluster volume).
+    if options.credentials.is_empty() && options.admin_token.is_none() {
         return Err(Error::Message(
             "no credentials saved; run `subhub add <name>`".into(),
         ));
@@ -75,6 +78,18 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         }
         None => Alphanumeric.sample_string(&mut rand::rng(), 32),
     };
+    if let Some(admin_token) = &options.admin_token {
+        if admin_token.is_empty() {
+            return Err(Error::Message("admin token must not be empty".into()));
+        }
+        if *admin_token == client_token {
+            return Err(Error::Message(
+                "admin token must differ from the client token; clients holding the \
+                 proxy token must not be able to write credentials"
+                    .into(),
+            ));
+        }
+    }
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -102,6 +117,7 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         refresh_locks: Arc::default(),
         refresh_backoff: Arc::new(Mutex::new(refresh_backoff)),
         client_token: Arc::new(client_token.clone()),
+        admin_token: Arc::new(options.admin_token),
         reserve_percent: options.reserve_percent,
     };
     let audit_state = state.clone();
@@ -131,6 +147,10 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
         .route(
             "/_subhub/reload",
             axum::routing::post(routes::reload_accounts),
+        )
+        .route(
+            "/_subhub/credentials/{name}",
+            axum::routing::put(routes::upsert_credential),
         )
         .route("/{*path}", any(routes::proxy))
         .with_state(state);

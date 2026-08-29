@@ -5,6 +5,10 @@
 #   kubectl create namespace subhub
 #   kubectl create secret generic subhub-client-token -n subhub \
 #     --from-literal=token="$(openssl rand -hex 32)"
+#   kubectl create secret generic subhub-admin-token -n subhub \
+#     --from-literal=token="$(openssl rand -hex 32)"
+# The admin token enables the credential-push API and lets the gateway start
+# with an empty volume; it must differ from the client token.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -47,6 +51,11 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: subhub-client-token
+                  key: token
+            - name: SUBHUB_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: subhub-admin-token
                   key: token
           ports:
             - containerPort: 7842

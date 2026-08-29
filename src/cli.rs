@@ -78,6 +78,17 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Push a saved credential to a remote gateway's admin API
+    Push {
+        /// Friendly name of the saved credential to push
+        name: String,
+        /// Remote gateway base URL, e.g. http://127.0.0.1:7842
+        #[arg(long, env = "SUBHUB_REMOTE")]
+        remote: String,
+        /// Admin token the remote gateway was started with
+        #[arg(long, env = "SUBHUB_ADMIN_TOKEN")]
+        admin_token: String,
+    },
     /// Manage the local Anthropic credential gateway
     Gateway {
         #[command(subcommand)]
@@ -107,6 +118,11 @@ enum GatewayCommands {
         /// Serve on a non-loopback address; requires an explicit client token
         #[arg(long)]
         allow_remote: bool,
+        /// Enable the credential-push admin API with this token; must differ
+        /// from the client token. Also lets the gateway start with no saved
+        /// credentials and wait to be seeded.
+        #[arg(long, env = "SUBHUB_ADMIN_TOKEN")]
+        admin_token: Option<String>,
     },
     /// Install and start the background gateway
     Install,
@@ -177,6 +193,11 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             let credentials = stored_credentials(&index)?;
             runtime()?.block_on(audit(credentials, json))
         }
+        Commands::Push {
+            name,
+            remote,
+            admin_token,
+        } => push(&index, &name, &remote, &admin_token),
         Commands::Gateway { command } => dispatch_gateway(command, &index),
     }
 }
@@ -190,6 +211,7 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
             audit_interval,
             background,
             allow_remote,
+            admin_token,
         } => {
             retire_active_claude_credential(index)?;
             let credentials = stored_credentials(index)?;
@@ -200,6 +222,7 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
                 audit_interval,
                 background,
                 allow_remote,
+                admin_token,
                 initial_selected: index.active_names(),
                 credentials,
             }))
@@ -313,6 +336,47 @@ fn add(
     println!("Saved \"{name}\"; the Subhub gateway is now its sole OAuth-token owner.");
     notify_gateway_reload();
     Ok(())
+}
+
+/// Send a saved credential to a remote gateway's admin API so a gateway
+/// running elsewhere (a cluster, another machine) can be seeded from the
+/// local vault without filesystem access. The entry travels as the same
+/// vault JSON `add` stored; the remote validates, persists, and reloads.
+fn push(index: &Index, name: &str, remote: &str, admin_token: &str) -> Result<()> {
+    if !index.contains(name) {
+        return Err(Error::Message(format!(
+            "credential \"{name}\" does not exist; run `subhub list`"
+        )));
+    }
+    let entry = vault_read(name)?;
+    let mut url = reqwest::Url::parse(remote)
+        .map_err(|error| Error::Message(format!("invalid remote URL \"{remote}\": {error}")))?;
+    url.path_segments_mut()
+        .map_err(|()| Error::Message(format!("invalid remote URL \"{remote}\"")))?
+        .pop_if_empty()
+        .extend(["_subhub", "credentials", name]);
+    runtime()?.block_on(async move {
+        let response = reqwest::Client::new()
+            .put(url)
+            .bearer_auth(admin_token)
+            .header("content-type", "application/json")
+            .body(entry)
+            // The remote audits every credential before replying.
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|error| Error::Message(format!("could not reach the remote: {error}")))?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::Message(format!(
+                "remote gateway returned {status}: {}",
+                body.chars().take(200).collect::<String>()
+            )));
+        }
+        println!("Pushed \"{name}\"; the remote gateway reloaded and can route it.");
+        Ok(())
+    })
 }
 
 fn active_claude_credential() -> Result<Option<String>> {

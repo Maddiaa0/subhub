@@ -69,6 +69,7 @@ pub(crate) struct ProxyState {
     pub(crate) refresh_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub(crate) refresh_backoff: Arc<Mutex<HashMap<String, RefreshBackoff>>>,
     pub(crate) client_token: Arc<String>,
+    pub(crate) admin_token: Arc<Option<String>>,
     pub(crate) reserve_percent: f64,
 }
 
@@ -170,6 +171,7 @@ pub(crate) fn test_state() -> ProxyState {
         refresh_locks: Arc::default(),
         refresh_backoff: Arc::default(),
         client_token: Arc::new("local-secret".into()),
+        admin_token: Arc::new(None),
         reserve_percent: 1.0,
     }
 }
