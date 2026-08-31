@@ -9,6 +9,7 @@ use super::selection::{
     mark_failed, routing_error_message, select_credential, set_selected_account,
 };
 use super::state::{ProxyState, persisted_refresh_backoffs};
+use crate::credentials::vault::VaultEntry;
 use crate::provider::{Provider, StoredCredential};
 use crate::{Error, Result};
 use axum::body::{Body, Bytes};
@@ -51,19 +52,27 @@ pub(super) async fn reload_accounts(
     if !authorized(&state, &headers) {
         return error_response(StatusCode::UNAUTHORIZED, "invalid local proxy token");
     }
-    let loaded = match tokio::task::spawn_blocking(crate::gateway_credentials).await {
-        Ok(Ok(credentials)) => credentials,
-        Ok(Err(error)) => {
+    let names = match reload_snapshot(&state).await {
+        Ok(names) => names,
+        Err(error) => {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
         }
-        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    if loaded.is_empty() {
+    if names.is_empty() {
         return error_response(
             StatusCode::BAD_REQUEST,
             "no credentials saved; run `subhub add <name>`",
         );
     }
+    json_response(StatusCode::OK, serde_json::json!({"credentials": names}))
+}
+
+/// Swap the in-memory snapshot for a fresh read of the index and vault,
+/// then audit so a successful return means "ready to serve".
+async fn reload_snapshot(state: &ProxyState) -> Result<Vec<String>> {
+    let loaded = tokio::task::spawn_blocking(crate::gateway_credentials)
+        .await
+        .map_err(|error| Error::Message(error.to_string()))??;
     let names: Vec<String> = loaded
         .iter()
         .map(|credential| credential.name.clone())
@@ -80,10 +89,83 @@ pub(super) async fn reload_accounts(
         .await
         .retain(|name, _| names.contains(name));
     state.selected.lock().await.retain_names(&names);
-    // Audit before replying: a credential without usage data is unroutable,
-    // so the caller may treat a successful reload as "ready to serve".
-    audit_all(&state).await;
-    json_response(StatusCode::OK, serde_json::json!({"credentials": names}))
+    audit_all(state).await;
+    Ok(names)
+}
+
+/// Admin API: save or replace one credential from a pushed vault entry, then
+/// reload so it is immediately routable. Requires the admin token — the
+/// client token deliberately cannot write credentials.
+pub(super) async fn upsert_credential(
+    State(state): State<ProxyState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(admin_token) = state.admin_token.as_deref() else {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "admin API is disabled; start the gateway with --admin-token",
+        );
+    };
+    if !token_matches(admin_token, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "invalid admin token");
+    }
+    if let Err(error) = crate::credentials::index::validate_name(&name) {
+        return error_response(StatusCode::BAD_REQUEST, &error.to_string());
+    }
+    let entry: VaultEntry = match serde_json::from_slice(&body) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("body is not a valid vault entry: {error}"),
+            );
+        }
+    };
+    // Reject entries the gateway could never route before touching the vault.
+    if let Err(error) = crate::credentials::stored_credential_from_entry(&name, &entry) {
+        return error_response(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string());
+    }
+    let provider = entry.provider;
+    let persist_name = name.clone();
+    let persisted = tokio::task::spawn_blocking(move || persist_pushed_entry(&persist_name, entry));
+    match persisted.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return error_response(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string());
+        }
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+    crate::observability::event(
+        "credential_pushed",
+        serde_json::json!({"credential": name, "provider": provider}),
+    );
+    let names = match reload_snapshot(&state).await {
+        Ok(names) => names,
+        Err(error) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+    };
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({"saved": name, "credentials": names}),
+    )
+}
+
+/// Blocking half of the push: uniqueness check, vault write, index update.
+fn persist_pushed_entry(name: &str, entry: VaultEntry) -> Result<()> {
+    let path = crate::index_path()?;
+    let mut index = crate::credentials::index::load_or_migrate_index(
+        &path,
+        &crate::credentials::index::legacy_index_path()?,
+    )?;
+    if entry.provider == Provider::Claude {
+        crate::credentials::ensure_unique_claude_identity(&index, name, &entry)?;
+    }
+    crate::credential_write(crate::VAULT_SERVICE, name, &serde_json::to_string(&entry)?)?;
+    index.add(name, entry.provider);
+    crate::credentials::index::save_index(&path, &index)
 }
 
 pub(super) async fn status(State(state): State<ProxyState>, headers: HeaderMap) -> Response {
@@ -276,7 +358,11 @@ fn oauth_beta_header(headers: &HeaderMap) -> String {
 }
 
 fn authorized(state: &ProxyState, headers: &HeaderMap) -> bool {
-    let expected = format!("Bearer {}", state.client_token);
+    token_matches(&state.client_token, headers)
+}
+
+fn token_matches(token: &str, headers: &HeaderMap) -> bool {
+    let expected = format!("Bearer {token}");
     headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -284,7 +370,7 @@ fn authorized(state: &ProxyState, headers: &HeaderMap) -> bool {
         || headers
             .get("x-api-key")
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value == state.client_token.as_str())
+            .is_some_and(|value| value == token)
 }
 
 fn into_axum_response(response: reqwest::Response) -> Response {
@@ -338,6 +424,50 @@ mod tests {
         assert!(authorized(&state, &headers));
         headers.insert("x-api-key", "wrong".parse().unwrap());
         assert!(!authorized(&state, &headers));
+    }
+
+    #[tokio::test]
+    async fn upsert_is_forbidden_without_a_configured_admin_token() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer local-secret".parse().unwrap());
+        let response = upsert_credential(
+            State(state),
+            axum::extract::Path("work".into()),
+            headers,
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn upsert_rejects_the_client_token_and_accepts_the_admin_token() {
+        let mut state = test_state();
+        state.admin_token = std::sync::Arc::new(Some("admin-secret".into()));
+        // The client token must not authorize credential writes.
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer local-secret".parse().unwrap());
+        let response = upsert_credential(
+            State(state.clone()),
+            axum::extract::Path("work".into()),
+            headers,
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // The admin token gets past auth; a token-less entry then fails
+        // routability validation, proving the request was actually considered.
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer admin-secret".parse().unwrap());
+        let response = upsert_credential(
+            State(state),
+            axum::extract::Path("work".into()),
+            headers,
+            Bytes::from_static(br#"{"credential":{},"oauthAccount":{}}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]

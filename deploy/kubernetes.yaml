@@ -1,0 +1,97 @@
+# Subhub as an in-cluster gateway. See deploy/README.md for seeding
+# credentials and wiring Omnigent runners to it.
+#
+# Before applying:
+#   kubectl create namespace subhub
+#   kubectl create secret generic subhub-client-token -n subhub \
+#     --from-literal=token="$(openssl rand -hex 32)"
+#   kubectl create secret generic subhub-admin-token -n subhub \
+#     --from-literal=token="$(openssl rand -hex 32)"
+# The admin token enables the credential-push API and lets the gateway start
+# with an empty volume; it must differ from the client token.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: subhub-data
+  namespace: subhub
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: subhub
+  namespace: subhub
+spec:
+  # The gateway must be the sole owner of each refresh-token family; its
+  # owner lock is a file lock on the volume, so never run two replicas.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: subhub
+  template:
+    metadata:
+      labels:
+        app: subhub
+    spec:
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: subhub
+          image: ghcr.io/maddiaa0/subhub:latest # pin a digest or tag in real use
+          env:
+            - name: SUBHUB_CLIENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: subhub-client-token
+                  key: token
+            - name: SUBHUB_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: subhub-admin-token
+                  key: token
+          ports:
+            - containerPort: 7842
+              name: gateway
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            tcpSocket:
+              port: gateway
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: gateway
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: subhub-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: subhub
+  namespace: subhub
+spec:
+  selector:
+    app: subhub
+  ports:
+    - name: gateway
+      port: 7842
+      targetPort: gateway

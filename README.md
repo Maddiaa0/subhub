@@ -55,6 +55,9 @@ subhub list                       List accounts and their providers
 subhub set <name> [--provider claude|codex]
                                   Select the gateway's preferred account
 subhub audit [--json]             Show subscription usage
+subhub push <name> --remote <url> Push a saved credential to a remote
+                                  gateway's admin API (token via
+                                  --admin-token or SUBHUB_ADMIN_TOKEN)
 
 subhub gateway install            Install and start the background gateway
 subhub gateway reinstall          Uninstall then install, preserving accounts
@@ -70,7 +73,17 @@ subhub gateway auth-token         Print the local gateway token
 
 ## How it works
 
-The authenticated gateway listens only on `127.0.0.1:7842`. It audits account
+The authenticated gateway listens on `127.0.0.1:7842` by default. Serving
+beyond the host (for example in a container or Kubernetes cluster) requires
+`--allow-remote` together with an explicit client token; see `deploy/README.md`
+for a container image and manifest.
+
+A gateway started with `--admin-token` (or `SUBHUB_ADMIN_TOKEN`) exposes a
+credential-push admin API: `subhub push <name> --remote <url>` uploads a
+locally saved account to it, and the remote validates, persists, and reloads
+it immediately. The admin token must differ from the client token — clients
+holding the proxy token cannot write credentials — and a gateway with an
+admin token may start with no saved credentials and wait to be seeded. It audits account
 capacity every two minutes and keeps using the selected credential while it is
 available. A pre-stream `401` or `429` may be retried once with another eligible
 credential; interrupted streams are never replayed.
