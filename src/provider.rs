@@ -1,5 +1,5 @@
-//! The provider seam: [`Provider`] and every behavior that differs between
-//! Claude and Codex.
+//! The provider seam: [`Provider`] and every behavior that differs across
+//! Claude, Codex, and Antigravity CLI.
 
 use crate::codex;
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ pub(crate) enum Provider {
     #[default]
     Claude,
     Codex,
+    Antigravity,
 }
 
 /// Everything the gateway does differently per provider lives in this impl.
@@ -21,6 +22,7 @@ impl Provider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
         }
     }
 
@@ -29,6 +31,16 @@ impl Provider {
         match self {
             Self::Claude => "Claude",
             Self::Codex => "Codex",
+            Self::Antigravity => "Antigravity",
+        }
+    }
+
+    /// Whether requests for this provider are proxied through the Subhub
+    /// gateway (as opposed to switching the CLI's active credential file).
+    pub(crate) fn uses_gateway(self) -> bool {
+        match self {
+            Self::Claude | Self::Codex => true,
+            Self::Antigravity => false,
         }
     }
 
@@ -41,18 +53,19 @@ impl Provider {
         }
     }
 
-    /// Upstream base URL requests are forwarded to.
-    pub(crate) fn upstream(self) -> &'static str {
+    /// Upstream base URL requests are forwarded to, if gateway-routed.
+    pub(crate) fn upstream(self) -> Option<&'static str> {
         match self {
-            Self::Claude => "https://api.anthropic.com",
-            Self::Codex => codex::RESPONSES_UPSTREAM,
+            Self::Claude => Some("https://api.anthropic.com"),
+            Self::Codex => Some(codex::RESPONSES_UPSTREAM),
+            Self::Antigravity => None,
         }
     }
 
     /// Rewrite an incoming gateway path into the upstream's path space.
     pub(crate) fn rewrite_upstream_path(self, path: &str) -> &str {
         match self {
-            Self::Claude => path,
+            Self::Claude | Self::Antigravity => path,
             Self::Codex => path.strip_prefix("/openai").unwrap_or(path),
         }
     }
@@ -61,7 +74,7 @@ impl Provider {
     pub(crate) fn supports_refresh(self) -> bool {
         match self {
             Self::Claude => true,
-            Self::Codex => false,
+            Self::Codex | Self::Antigravity => false,
         }
     }
 }
@@ -107,5 +120,16 @@ mod tests {
             Provider::Claude.rewrite_upstream_path("/v1/messages"),
             "/v1/messages"
         );
+    }
+
+    #[test]
+    fn antigravity_is_file_switched_not_gateway_routed() {
+        assert_eq!(Provider::Antigravity.name(), "antigravity");
+        assert_eq!(Provider::Antigravity.display_name(), "Antigravity");
+        assert!(!Provider::Antigravity.uses_gateway());
+        assert!(Provider::Antigravity.upstream().is_none());
+        assert!(!Provider::Antigravity.supports_refresh());
+        assert!(Provider::Claude.uses_gateway());
+        assert!(Provider::Codex.uses_gateway());
     }
 }

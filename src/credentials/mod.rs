@@ -6,20 +6,26 @@ pub(crate) mod index;
 pub(crate) mod oauth;
 pub(crate) mod vault;
 
+use crate::antigravity;
 use crate::provider::{Provider, StoredCredential};
 use crate::{Error, Result};
 use index::{Index, index_path, legacy_index_path, load_or_migrate_index};
 use serde_json::Value;
+use std::path::Path;
 use vault::{
-    ACTIVE_SERVICE, VaultEntry, active_credential_read, clear_active_claude_oauth,
+    ACTIVE_SERVICE, VAULT_SERVICE, VaultEntry, active_credential_read, clear_active_claude_oauth,
     credential_write, current_user, vault_read,
 };
 
 /// Fresh vault snapshot for the gateway's `/_subhub/reload` endpoint.
+/// Only includes providers routed through the gateway.
 pub(crate) fn gateway_credentials() -> Result<Vec<StoredCredential>> {
     let path = index_path()?;
     let index = load_or_migrate_index(&path, &legacy_index_path()?)?;
-    stored_credentials(&index)
+    Ok(stored_credentials(&index)?
+        .into_iter()
+        .filter(|credential| credential.provider.uses_gateway())
+        .collect())
 }
 
 pub(crate) fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>> {
@@ -43,10 +49,14 @@ pub(crate) fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>>
             .ok_or_else(|| Error::Message(format!("credential \"{name}\" has no credential")))?;
         let oauth = credential.get("claudeAiOauth").and_then(Value::as_object);
         let access_token = match provider {
-            Provider::Claude => oauth.and_then(|value| value.get("accessToken")),
-            Provider::Codex => credential.pointer("/tokens/access_token"),
+            Provider::Claude => oauth
+                .and_then(|value| value.get("accessToken"))
+                .and_then(Value::as_str),
+            Provider::Codex => credential
+                .pointer("/tokens/access_token")
+                .and_then(Value::as_str),
+            Provider::Antigravity => antigravity::access_token(credential),
         }
-        .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| Error::Message(format!("credential \"{name}\" has no access token")))?;
         let scopes = oauth
@@ -60,18 +70,28 @@ pub(crate) fn stored_credentials(index: &Index) -> Result<Vec<StoredCredential>>
                     .collect()
             })
             .unwrap_or_default();
-        credentials.push(StoredCredential {
-            name: name.clone(),
-            access_token: access_token.to_owned(),
-            expires_at: oauth
+        let expires_at = match provider {
+            Provider::Claude => oauth
                 .and_then(|value| value.get("expiresAt"))
                 .and_then(Value::as_i64),
-            scopes,
-            provider,
-            account_id: credential
+            Provider::Codex => None,
+            Provider::Antigravity => antigravity::expires_at_millis(credential),
+        };
+        let account_id = match provider {
+            Provider::Claude => None,
+            Provider::Codex => credential
                 .pointer("/tokens/account_id")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            Provider::Antigravity => antigravity::email(credential).map(str::to_owned),
+        };
+        credentials.push(StoredCredential {
+            name: name.clone(),
+            access_token: access_token.to_owned(),
+            expires_at,
+            scopes,
+            provider,
+            account_id,
             refresh_error: parsed
                 .get("refreshError")
                 .and_then(Value::as_str)
@@ -90,10 +110,15 @@ pub(crate) fn stored_credential_from_entry(
         .get("claudeAiOauth")
         .and_then(Value::as_object);
     let access_token = match entry.provider {
-        Provider::Claude => oauth.and_then(|value| value.get("accessToken")),
-        Provider::Codex => entry.credential.pointer("/tokens/access_token"),
+        Provider::Claude => oauth
+            .and_then(|value| value.get("accessToken"))
+            .and_then(Value::as_str),
+        Provider::Codex => entry
+            .credential
+            .pointer("/tokens/access_token")
+            .and_then(Value::as_str),
+        Provider::Antigravity => antigravity::access_token(&entry.credential),
     }
-    .and_then(Value::as_str)
     .filter(|value| !value.is_empty())
     .ok_or_else(|| Error::Message(format!("credential \"{name}\" has no access token")))?;
     let scopes = oauth
@@ -107,19 +132,29 @@ pub(crate) fn stored_credential_from_entry(
                 .collect()
         })
         .unwrap_or_default();
-    Ok(StoredCredential {
-        name: name.to_owned(),
-        access_token: access_token.to_owned(),
-        expires_at: oauth
+    let expires_at = match entry.provider {
+        Provider::Claude => oauth
             .and_then(|value| value.get("expiresAt"))
             .and_then(Value::as_i64),
-        scopes,
-        provider: entry.provider,
-        account_id: entry
+        Provider::Codex => None,
+        Provider::Antigravity => antigravity::expires_at_millis(&entry.credential),
+    };
+    let account_id = match entry.provider {
+        Provider::Claude => None,
+        Provider::Codex => entry
             .credential
             .pointer("/tokens/account_id")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        Provider::Antigravity => antigravity::email(&entry.credential).map(str::to_owned),
+    };
+    Ok(StoredCredential {
+        name: name.to_owned(),
+        access_token: access_token.to_owned(),
+        expires_at,
+        scopes,
+        provider: entry.provider,
+        account_id,
         refresh_error: entry.refresh_error.clone(),
     })
 }
@@ -250,6 +285,94 @@ pub(crate) fn restore_active_claude_credential(index: &Index) -> Result<bool> {
     Ok(true)
 }
 
+pub(crate) fn ensure_unique_antigravity_identity(
+    index: &Index,
+    replacing_name: &str,
+    candidate: &VaultEntry,
+) -> Result<()> {
+    for name in &index.credentials {
+        if name == replacing_name {
+            continue;
+        }
+        let stored = vault_read(name).map_err(|error| {
+            Error::Message(format!(
+                "could not verify Antigravity account uniqueness against \"{name}\": {error}"
+            ))
+        })?;
+        let existing = serde_json::from_str::<VaultEntry>(&stored).map_err(|error| {
+            Error::Message(format!(
+                "could not verify Antigravity account uniqueness against \"{name}\": {error}"
+            ))
+        })?;
+        if existing.provider == Provider::Antigravity
+            && antigravity::same_identity(&existing.credential, &candidate.credential)
+        {
+            return Err(Error::Message(format!(
+                "this Antigravity account is already saved as \"{name}\"; use `subhub add {name} --force` to replace it"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// If the active Antigravity token file on disk still belongs to the currently
+/// active saved Antigravity account and `agy` refreshed it since it was saved,
+/// persist that fresher token back to the vault before switching away.
+pub(crate) fn sync_active_antigravity_credential(index: &Index, token_path: &Path) -> Result<bool> {
+    let Some(active_name) = index.active_for(Provider::Antigravity) else {
+        return Ok(false);
+    };
+    let Ok(stored) = vault_read(active_name) else {
+        return Ok(false);
+    };
+    let Ok(mut entry) = serde_json::from_str::<VaultEntry>(&stored) else {
+        return Ok(false);
+    };
+    if entry.provider != Provider::Antigravity {
+        return Ok(false);
+    }
+    let Some(raw) = antigravity::read_active_token(token_path)? else {
+        return Ok(false);
+    };
+    let Ok(on_disk) = antigravity::validate_credential(&raw) else {
+        return Ok(false);
+    };
+    if !should_sync_antigravity_token(&entry.credential, &on_disk) {
+        return Ok(false);
+    }
+    entry.credential = on_disk;
+    if let Some(email) = antigravity::email(&entry.credential) {
+        entry.oauth_account = serde_json::json!({ "emailAddress": email });
+    }
+    credential_write(VAULT_SERVICE, active_name, &serde_json::to_string(&entry)?)?;
+    Ok(true)
+}
+
+fn should_sync_antigravity_token(saved: &Value, on_disk: &Value) -> bool {
+    antigravity::same_identity(saved, on_disk) && saved != on_disk
+}
+
+/// Activate `name` as the on-disk Antigravity CLI token, syncing any refreshed
+/// token from the previously active Antigravity account back to the vault first.
+pub(crate) fn activate_antigravity_credential(
+    index: &Index,
+    name: &str,
+    entry: &VaultEntry,
+    token_path: &Path,
+) -> Result<bool> {
+    antigravity::validate_credential_value(&entry.credential)?;
+    let synced = sync_active_antigravity_credential(index, token_path)?;
+    if index.active_for(Provider::Antigravity) == Some(name)
+        && let Some(raw) = antigravity::read_active_token(token_path)?
+        && let Ok(on_disk) = antigravity::validate_credential(&raw)
+        && antigravity::same_identity(&entry.credential, &on_disk)
+    {
+        return Ok(synced);
+    }
+    antigravity::write_active_token(token_path, &entry.credential)?;
+    Ok(synced)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +408,50 @@ mod tests {
             &claude_entry(None, "same-token"),
             &claude_entry(None, "same-token")
         ));
+    }
+
+    #[test]
+    fn stored_credential_from_antigravity_entry_extracts_token_email_and_expiry() {
+        let entry = VaultEntry {
+            provider: Provider::Antigravity,
+            credential: serde_json::json!({
+                "token": {
+                    "access_token": "ya29.access",
+                    "token_type": "Bearer",
+                    "refresh_token": "1//refresh",
+                    "expiry": "2030-08-01T13:00:00Z",
+                    "expires_in": 3599
+                },
+                "auth_method": "oauth",
+                "id_token_email": "dev@example.com"
+            }),
+            oauth_account: serde_json::json!({"emailAddress": "dev@example.com"}),
+            refresh_error: None,
+        };
+        let stored = stored_credential_from_entry("work", &entry).unwrap();
+        assert_eq!(stored.provider, Provider::Antigravity);
+        assert_eq!(stored.access_token, "ya29.access");
+        assert_eq!(stored.account_id.as_deref(), Some("dev@example.com"));
+        assert!(stored.expires_at.is_some());
+    }
+
+    #[test]
+    fn antigravity_sync_only_updates_when_identity_matches_and_token_changed() {
+        let saved = serde_json::json!({
+            "token": {"access_token": "old", "refresh_token": "r1"},
+            "id_token_email": "work@example.com"
+        });
+        let refreshed = serde_json::json!({
+            "token": {"access_token": "new", "refresh_token": "r1"},
+            "id_token_email": "work@example.com"
+        });
+        let other = serde_json::json!({
+            "token": {"access_token": "other", "refresh_token": "r2"},
+            "id_token_email": "personal@example.com"
+        });
+
+        assert!(!should_sync_antigravity_token(&saved, &saved));
+        assert!(should_sync_antigravity_token(&saved, &refreshed));
+        assert!(!should_sync_antigravity_token(&saved, &other));
     }
 }

@@ -100,11 +100,10 @@ pub(crate) async fn serve(options: ServeOptions) -> Result<()> {
             .credentials
             .iter()
             .find(|credential| credential.name == name)
+            && let Some(slot) = initial_selected.slot(credential.provider)
+            && slot.is_none()
         {
-            let slot = initial_selected.slot(credential.provider);
-            if slot.is_none() {
-                *slot = Some(name);
-            }
+            *slot = Some(name);
         }
     }
     let refresh_backoff = persisted_refresh_backoffs(&options.credentials);

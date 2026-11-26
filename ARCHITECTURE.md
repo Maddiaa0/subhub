@@ -2,7 +2,8 @@
 
 Subhub is a CLI plus a local gateway that routes Claude Code and Codex
 traffic through saved subscription credentials, picking the account with the
-most headroom and rotating when one hits its limits.
+most headroom and rotating when one hits its limits, and switches Antigravity
+CLI accounts directly on disk.
 
 ## The one flow that explains everything
 
@@ -36,7 +37,7 @@ The CLI's `gateway status` / `doctor` / `statusline` read the gateway's
 |---|---|
 | `cli` | clap types, dispatch, `add`/`list`/`set`/`audit` handlers |
 | `error` | typed errors; routing decisions use error *kinds*, never message text |
-| `provider` | the per-provider seam: everything Claude/Codex-specific in one impl |
+| `provider` | the per-provider seam: everything Claude/Codex/Antigravity-specific in one impl |
 | `paths` | config file locations, atomic owner-only JSON writes |
 | `credentials/vault` | OS secret storage; only this module touches raw vault payloads |
 | `credentials/index` | credential names + active slots; never stores secrets |
@@ -45,7 +46,7 @@ The CLI's `gateway status` / `doctor` / `statusline` read the gateway's
 | `service` | install/uninstall, LaunchAgent/systemd management, admin-endpoint client |
 | `output` | terminal rendering (health listings, status-line segment) |
 | `observability` | append-only JSONL event log for `gateway logs` |
-| `usage`, `codex` | provider usage snapshots and endpoints |
+| `usage`, `codex`, `antigravity` | provider usage snapshots, endpoints, and Antigravity token-file I/O |
 
 ## Invariants
 

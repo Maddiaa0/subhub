@@ -14,10 +14,12 @@ use crate::credentials::vault::{
     vault_read,
 };
 use crate::credentials::{
+    activate_antigravity_credential, ensure_unique_antigravity_identity,
     ensure_unique_claude_identity, retire_active_claude_credential, stored_credentials,
+    sync_active_antigravity_credential,
 };
 use crate::provider::Provider;
-use crate::{Error, Result, codex, gateway, runtime, service, usage};
+use crate::{Error, Result, antigravity, codex, gateway, runtime, service, usage};
 use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -33,7 +35,7 @@ use std::process::{Command, ExitStatus, Stdio};
 #[command(
     name = "subhub",
     version,
-    about = "Manage Claude Code and Codex subscriptions"
+    about = "Manage Claude Code, Codex, and Antigravity CLI subscriptions"
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -48,14 +50,17 @@ impl Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Choose Claude Code or Codex and save its subscription under NAME
+    /// Choose Claude Code, Codex, or Antigravity CLI and save its subscription under NAME
     Add {
         /// Friendly name for the credential
         name: String,
+        /// Subscription provider (skips interactive prompt when set)
+        #[arg(long, value_enum)]
+        provider: Option<ProviderArg>,
         /// Replace an existing credential with the same name
         #[arg(long, short)]
         force: bool,
-        /// Capture Claude Code's current OAuth login instead of opening a new login
+        /// Capture the CLI's current OAuth login instead of opening a new login (Claude Code or Antigravity CLI)
         #[arg(long, conflicts_with = "device_auth")]
         capture: bool,
         /// Use device-code authentication for the Codex login (for remote or headless machines)
@@ -161,10 +166,11 @@ enum GatewayCommands {
     Statusline,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ProviderArg {
     Claude,
     Codex,
+    Antigravity,
 }
 
 impl From<ProviderArg> for Provider {
@@ -172,6 +178,7 @@ impl From<ProviderArg> for Provider {
         match provider {
             ProviderArg::Claude => Self::Claude,
             ProviderArg::Codex => Self::Codex,
+            ProviderArg::Antigravity => Self::Antigravity,
         }
     }
 }
@@ -183,10 +190,19 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Add {
             name,
+            provider,
             force,
             capture,
             device_auth,
-        } => add(&path, &mut index, &name, force, capture, device_auth),
+        } => add(
+            &path,
+            &mut index,
+            &name,
+            provider.map(Into::into),
+            force,
+            capture,
+            device_auth,
+        ),
         Commands::List => list(&index),
         Commands::Set { name, provider } => set(&path, &mut index, &name, provider.map(Into::into)),
         Commands::Audit { json } => {
@@ -214,7 +230,10 @@ fn dispatch_gateway(command: GatewayCommands, index: &Index) -> Result<()> {
             admin_token,
         } => {
             retire_active_claude_credential(index)?;
-            let credentials = stored_credentials(index)?;
+            let credentials = stored_credentials(index)?
+                .into_iter()
+                .filter(|credential| credential.provider.uses_gateway())
+                .collect();
             runtime()?.block_on(gateway::serve(gateway::ServeOptions {
                 listen,
                 client_token,
@@ -248,6 +267,7 @@ fn add(
     path: &Path,
     index: &mut Index,
     name: &str,
+    provider: Option<Provider>,
     force: bool,
     capture: bool,
     device_auth: bool,
@@ -259,21 +279,35 @@ fn add(
         )));
     }
 
-    println!("Choose subscription type:\n  1) Claude Code\n  2) Codex");
-    let mut choice = String::new();
-    io::stdin().read_line(&mut choice)?;
-    if choice.trim() == "2" {
-        if capture {
-            return Err(Error::Message(
-                "--capture only applies to Claude Code logins; choose subscription type 1".into(),
-            ));
+    let selected_provider = match provider {
+        Some(provider) => provider,
+        None => prompt_provider()?,
+    };
+
+    match selected_provider {
+        Provider::Codex => {
+            if capture {
+                return Err(Error::Message(
+                    "--capture only applies to Claude Code and Antigravity CLI logins".into(),
+                ));
+            }
+            return add_codex(path, index, name, device_auth);
         }
-        return add_codex(path, index, name, device_auth);
-    }
-    if device_auth {
-        return Err(Error::Message(
-            "--device-auth only applies to Codex logins; choose subscription type 2".into(),
-        ));
+        Provider::Antigravity => {
+            if device_auth {
+                return Err(Error::Message(
+                    "--device-auth only applies to Codex logins; choose subscription type 2".into(),
+                ));
+            }
+            return add_antigravity(path, index, name, capture);
+        }
+        Provider::Claude => {
+            if device_auth {
+                return Err(Error::Message(
+                    "--device-auth only applies to Codex logins; choose subscription type 2".into(),
+                ));
+            }
+        }
     }
     let credential = if capture {
         println!("Capturing Claude Code's active login as credential \"{name}\"...");
@@ -338,6 +372,24 @@ fn add(
     Ok(())
 }
 
+fn prompt_provider() -> Result<Provider> {
+    println!("Choose subscription type:\n  1) Claude Code\n  2) Codex\n  3) Antigravity CLI");
+    let mut choice = String::new();
+    io::stdin().read_line(&mut choice)?;
+    parse_provider_choice(&choice)
+}
+
+fn parse_provider_choice(choice: &str) -> Result<Provider> {
+    match choice.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "claude" => Ok(Provider::Claude),
+        "2" | "codex" => Ok(Provider::Codex),
+        "3" | "antigravity" | "agy" => Ok(Provider::Antigravity),
+        other => Err(Error::Message(format!(
+            "invalid subscription type \"{other}\"; choose 1 (Claude Code), 2 (Codex), or 3 (Antigravity CLI)"
+        ))),
+    }
+}
+
 /// Send a saved credential to a remote gateway's admin API so a gateway
 /// running elsewhere (a cluster, another machine) can be seeded from the
 /// local vault without filesystem access. The entry travels as the same
@@ -349,6 +401,17 @@ fn push(index: &Index, name: &str, remote: &str, admin_token: &str) -> Result<()
         )));
     }
     let entry = vault_read(name)?;
+    let parsed_entry: VaultEntry = serde_json::from_str(&entry).map_err(|error| {
+        Error::Message(format!(
+            "credential \"{name}\" is not a valid vault entry: {error}"
+        ))
+    })?;
+    if !parsed_entry.provider.uses_gateway() {
+        return Err(Error::Message(format!(
+            "{} credentials are switched locally via `subhub set` and cannot be pushed to a remote gateway",
+            parsed_entry.provider.display_name()
+        )));
+    }
     let mut url = reqwest::Url::parse(remote)
         .map_err(|error| Error::Message(format!("invalid remote URL \"{remote}\": {error}")))?;
     url.path_segments_mut()
@@ -464,6 +527,88 @@ fn add_codex(path: &Path, index: &mut Index, name: &str, device_auth: bool) -> R
     Ok(())
 }
 
+fn add_antigravity(path: &Path, index: &mut Index, name: &str, capture: bool) -> Result<()> {
+    use rand::distr::{Alphanumeric, SampleString};
+    let active_path = antigravity::token_path()?;
+    let raw = if capture {
+        println!("Capturing Antigravity CLI's active login as credential \"{name}\"...");
+        antigravity::read_active_token(&active_path)?.ok_or_else(|| {
+            Error::Message(format!(
+                "Antigravity CLI has no active OAuth token file at {}; log into `agy` first (with `AGY_ACP_FORCE_FILE_STORAGE=1` if using a keyring) or run `subhub add {name} --provider antigravity` without `--capture`",
+                active_path.display()
+            ))
+        })?
+    } else {
+        let temporary_home = env::temp_dir().join(format!(
+            "subhub-antigravity-login-{}",
+            Alphanumeric.sample_string(&mut rand::rng(), 16)
+        ));
+        fs::create_dir(&temporary_home)?;
+        fs::set_permissions(&temporary_home, fs::Permissions::from_mode(0o700))?;
+        let temp_token_path = antigravity::token_path_in_home(&temporary_home);
+        println!("Opening Antigravity CLI login for credential \"{name}\"...");
+        let status = Command::new("agy")
+            .args(["acp", "--login"])
+            .env("HOME", &temporary_home)
+            .env("AGY_ACP_FORCE_FILE_STORAGE", "1")
+            .env_remove("GEMINI_HOME")
+            .env_remove("ANTIGRAVITY_APP_DATA_DIR")
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|error| {
+                Error::Message(format!(
+                    "could not run `agy acp --login`: {error} (or log into `agy` and run `subhub add {name} --provider antigravity --capture`)"
+                ))
+            });
+        let captured = (|| {
+            let status = status?;
+            require_success(status, "`agy acp --login` failed")?;
+            antigravity::read_active_token(&temp_token_path)?.ok_or_else(|| {
+                Error::Message(
+                    "Antigravity login completed, but no OAuth token file was written".into(),
+                )
+            })
+        })();
+        let _ = fs::remove_dir_all(&temporary_home);
+        captured?
+    };
+
+    let credential = antigravity::validate_credential(&raw)?;
+    let email = antigravity::email(&credential).map(str::to_owned);
+    let oauth_account = email.as_deref().map_or(
+        Value::Null,
+        |email| serde_json::json!({ "emailAddress": email }),
+    );
+    let vault_entry = VaultEntry {
+        provider: Provider::Antigravity,
+        credential,
+        oauth_account,
+        refresh_error: None,
+    };
+    ensure_unique_antigravity_identity(index, name, &vault_entry)?;
+    if !capture {
+        let _ = sync_active_antigravity_credential(index, &active_path)?;
+    }
+    credential_write(VAULT_SERVICE, name, &serde_json::to_string(&vault_entry)?)?;
+    if !capture {
+        antigravity::write_active_token(&active_path, &vault_entry.credential)?;
+    }
+    index.add(name, Provider::Antigravity);
+    save_index(path, index)?;
+    if let Some(email) = email {
+        println!("Saved Antigravity CLI account \"{name}\" ({email}).");
+    } else {
+        println!("Saved Antigravity CLI account \"{name}\".");
+    }
+    println!(
+        "Active token file: {} (switch accounts with `subhub set <name> --provider antigravity`).",
+        active_path.display()
+    );
+    Ok(())
+}
+
 fn list(index: &Index) -> Result<()> {
     if index.credentials.is_empty() {
         println!("No credentials saved. Run `subhub add <name>`.");
@@ -519,6 +664,25 @@ fn set(
             expected.name()
         )));
     }
+    if entry.provider == Provider::Antigravity {
+        let token_path = antigravity::token_path()?;
+        let synced = activate_antigravity_credential(index, name, &entry, &token_path)?;
+        index.activate(name, Provider::Antigravity);
+        save_index(path, index)?;
+        if synced {
+            println!("Saved refreshed token from previous active Antigravity account.");
+        }
+        if let Some(email) = antigravity::email(&entry.credential) {
+            println!("Active Antigravity credential set to \"{name}\" ({email}).");
+        } else {
+            println!("Active Antigravity credential set to \"{name}\".");
+        }
+        println!(
+            "Updated {}; new `agy` sessions will use this account.",
+            token_path.display()
+        );
+        return Ok(());
+    }
     if entry.provider == Provider::Claude {
         let credential = serde_json::to_string(&entry.credential)?;
         validate_credential(&credential)?;
@@ -558,6 +722,7 @@ struct AuditResult {
 enum AuditUsage {
     Claude(usage::UsageSnapshot),
     Codex(codex::UsageSnapshot),
+    Antigravity(antigravity::LocalStatus),
 }
 
 async fn audit(credentials: Vec<crate::provider::StoredCredential>, json: bool) -> Result<()> {
@@ -571,8 +736,17 @@ async fn audit(credentials: Vec<crate::provider::StoredCredential>, json: bool) 
     let mut results = Vec::with_capacity(credentials.len());
     for credential in credentials {
         let provider = credential.provider;
-        let result = if provider == Provider::Codex {
-            match credential.account_id.as_deref() {
+        let result = match provider {
+            Provider::Antigravity => AuditResult {
+                usage: Some(AuditUsage::Antigravity(
+                    antigravity::LocalStatus::from_stored(&credential),
+                )),
+                name: credential.name,
+                provider,
+                status: "local",
+                error: None,
+            },
+            Provider::Codex => match credential.account_id.as_deref() {
                 Some(account) => {
                     match codex::fetch_usage(&client, &credential.access_token, account).await {
                         Ok(usage) => AuditResult {
@@ -598,36 +772,39 @@ async fn audit(credentials: Vec<crate::provider::StoredCredential>, json: bool) 
                     usage: None,
                     error: Some("missing Codex account id".into()),
                 },
-            }
-        } else if !credential.scopes.is_empty()
-            && !credential
-                .scopes
-                .iter()
-                .any(|scope| scope == "user:profile")
-        {
-            AuditResult {
-                name: credential.name,
-                provider,
-                status: "unavailable",
-                usage: None,
-                error: Some("OAuth token lacks user:profile scope".into()),
-            }
-        } else {
-            match usage_client.fetch(&credential.access_token).await {
-                Ok(usage) => AuditResult {
-                    name: credential.name,
-                    provider,
-                    status: "available",
-                    usage: Some(AuditUsage::Claude(usage)),
-                    error: None,
-                },
-                Err(error) => AuditResult {
-                    name: credential.name,
-                    provider,
-                    status: "unavailable",
-                    usage: None,
-                    error: Some(error.to_string()),
-                },
+            },
+            Provider::Claude => {
+                if !credential.scopes.is_empty()
+                    && !credential
+                        .scopes
+                        .iter()
+                        .any(|scope| scope == "user:profile")
+                {
+                    AuditResult {
+                        name: credential.name,
+                        provider,
+                        status: "unavailable",
+                        usage: None,
+                        error: Some("OAuth token lacks user:profile scope".into()),
+                    }
+                } else {
+                    match usage_client.fetch(&credential.access_token).await {
+                        Ok(usage) => AuditResult {
+                            name: credential.name,
+                            provider,
+                            status: "available",
+                            usage: Some(AuditUsage::Claude(usage)),
+                            error: None,
+                        },
+                        Err(error) => AuditResult {
+                            name: credential.name,
+                            provider,
+                            status: "unavailable",
+                            usage: None,
+                            error: Some(error.to_string()),
+                        },
+                    }
+                }
             }
         };
         results.push(result);
@@ -658,6 +835,18 @@ async fn audit(credentials: Vec<crate::provider::StoredCredential>, json: bool) 
                         .and_then(|w| w.used_percent)
                         .unwrap_or(0.0)
                 ),
+                Some(AuditUsage::Antigravity(status)) => {
+                    let email = status.email.as_deref().unwrap_or("unknown email");
+                    let token_state = match status.access_token_expired {
+                        Some(true) => "access token expired; refreshed by agy on next run",
+                        Some(false) => "access token valid",
+                        None => "expiry unknown",
+                    };
+                    println!(
+                        "{} [antigravity]: local file-switched ({email}, {token_state})",
+                        result.name
+                    );
+                }
                 None => println!(
                     "{}: unavailable ({})",
                     result.name,
@@ -723,6 +912,59 @@ mod tests {
             Cli::try_parse_from(["subhub", "add", "personal", "--capture", "--device-auth"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn provider_flag_supports_antigravity_on_add_set_and_status() {
+        let add = Cli::try_parse_from([
+            "subhub",
+            "add",
+            "agy-work",
+            "--provider",
+            "antigravity",
+            "--capture",
+        ])
+        .unwrap();
+        assert!(matches!(
+            add.command,
+            Commands::Add {
+                provider: Some(ProviderArg::Antigravity),
+                capture: true,
+                ..
+            }
+        ));
+
+        let set = Cli::try_parse_from(["subhub", "set", "agy-work", "--provider", "antigravity"])
+            .unwrap();
+        assert!(matches!(
+            set.command,
+            Commands::Set {
+                provider: Some(ProviderArg::Antigravity),
+                ..
+            }
+        ));
+
+        let status =
+            Cli::try_parse_from(["subhub", "gateway", "status", "--provider", "antigravity"])
+                .unwrap();
+        assert!(matches!(
+            status.command,
+            Commands::Gateway {
+                command: GatewayCommands::Status {
+                    provider: Some(ProviderArg::Antigravity)
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn interactive_provider_choices_map_to_expected_providers() {
+        assert_eq!(parse_provider_choice("").unwrap(), Provider::Claude);
+        assert_eq!(parse_provider_choice("1\n").unwrap(), Provider::Claude);
+        assert_eq!(parse_provider_choice("2\n").unwrap(), Provider::Codex);
+        assert_eq!(parse_provider_choice("3\n").unwrap(), Provider::Antigravity);
+        assert_eq!(parse_provider_choice("agy").unwrap(), Provider::Antigravity);
+        assert!(parse_provider_choice("9").is_err());
     }
 
     #[test]

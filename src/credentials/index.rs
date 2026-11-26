@@ -18,6 +18,8 @@ pub(crate) struct Index {
     active_claude: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_codex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_antigravity: Option<String>,
     pub(crate) credentials: Vec<String>,
 }
 
@@ -28,6 +30,7 @@ impl Index {
             active: None,
             active_claude: None,
             active_codex: None,
+            active_antigravity: None,
             credentials: Vec::new(),
         }
     }
@@ -49,6 +52,7 @@ impl Index {
         *match provider {
             Provider::Claude => &mut self.active_claude,
             Provider::Codex => &mut self.active_codex,
+            Provider::Antigravity => &mut self.active_antigravity,
         } = Some(name.to_owned());
     }
 
@@ -58,6 +62,7 @@ impl Index {
         match provider {
             Provider::Claude => &self.active_claude,
             Provider::Codex => &self.active_codex,
+            Provider::Antigravity => &self.active_antigravity,
         }
         .as_deref()
         .or(self.active.as_deref())
@@ -65,9 +70,14 @@ impl Index {
 
     pub(crate) fn active_names(&self) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
-        for name in [&self.active_claude, &self.active_codex, &self.active]
-            .into_iter()
-            .flatten()
+        for name in [
+            &self.active_claude,
+            &self.active_codex,
+            &self.active_antigravity,
+            &self.active,
+        ]
+        .into_iter()
+        .flatten()
         {
             if !names.contains(name) {
                 names.push(name.clone());
@@ -149,12 +159,14 @@ mod tests {
     fn adding_names_is_sorted_and_marks_active() {
         let mut index = Index::new();
         index.add("work", Provider::Codex);
+        index.add("agy", Provider::Antigravity);
         index.add("personal", Provider::Claude);
-        assert_eq!(index.credentials, ["personal", "work"]);
+        assert_eq!(index.credentials, ["agy", "personal", "work"]);
         assert_eq!(index.active.as_deref(), Some("personal"));
         assert_eq!(index.active_for(Provider::Claude), Some("personal"));
         assert_eq!(index.active_for(Provider::Codex), Some("work"));
-        assert_eq!(index.active_names(), ["personal", "work"]);
+        assert_eq!(index.active_for(Provider::Antigravity), Some("agy"));
+        assert_eq!(index.active_names(), ["personal", "work", "agy"]);
     }
 
     #[test]

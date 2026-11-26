@@ -123,6 +123,15 @@ pub(super) async fn upsert_credential(
             );
         }
     };
+    if !entry.provider.uses_gateway() {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!(
+                "{} credentials are switched locally via `subhub set` and cannot be served by the gateway",
+                entry.provider.display_name()
+            ),
+        );
+    }
     // Reject entries the gateway could never route before touching the vault.
     if let Err(error) = crate::credentials::stored_credential_from_entry(&name, &entry) {
         return error_response(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string());
@@ -303,7 +312,12 @@ async fn forward(
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or("/");
-    let upstream = credential.provider.upstream();
+    let Some(upstream) = credential.provider.upstream() else {
+        return Err(Error::Message(format!(
+            "{} credentials are switched locally and cannot be forwarded by the gateway",
+            credential.provider.display_name()
+        )));
+    };
     let path = credential.provider.rewrite_upstream_path(path);
     let mut request = state
         .client
@@ -313,8 +327,16 @@ async fn forward(
     request = match credential.provider {
         Provider::Claude => request.header("anthropic-beta", oauth_beta_header(&parts.headers)),
         Provider::Codex => request.header("openai-beta", "codex-1"),
+        Provider::Antigravity => {
+            return Err(Error::Message(
+                "Antigravity credentials are switched locally and cannot be forwarded by the gateway"
+                    .into(),
+            ));
+        }
     };
-    if let Some(account) = &credential.account_id {
+    if credential.provider == Provider::Codex
+        && let Some(account) = &credential.account_id
+    {
         request = request.header("chatgpt-account-id", account);
     }
     for (name, value) in &parts.headers {
@@ -465,6 +487,24 @@ mod tests {
             axum::extract::Path("work".into()),
             headers,
             Bytes::from_static(br#"{"credential":{},"oauthAccount":{}}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn upsert_rejects_non_gateway_antigravity_credentials() {
+        let mut state = test_state();
+        state.admin_token = std::sync::Arc::new(Some("admin-secret".into()));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer admin-secret".parse().unwrap());
+        let response = upsert_credential(
+            State(state),
+            axum::extract::Path("agy-work".into()),
+            headers,
+            Bytes::from_static(
+                br#"{"provider":"antigravity","credential":{"token":{"access_token":"a","refresh_token":"r"}},"oauthAccount":null}"#,
+            ),
         )
         .await;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
