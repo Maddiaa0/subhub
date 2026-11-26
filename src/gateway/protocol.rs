@@ -29,6 +29,7 @@ impl SelectedReport {
         match provider {
             Provider::Claude => self.claude.as_deref(),
             Provider::Codex => self.codex.as_deref(),
+            Provider::Antigravity => None,
         }
     }
 }

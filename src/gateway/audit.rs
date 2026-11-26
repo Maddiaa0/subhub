@@ -14,6 +14,9 @@ use crate::{Error, Result};
 pub(super) async fn audit_all(state: &ProxyState) {
     let credentials = state.credentials.read().await.clone();
     for credential in &credentials {
+        if !credential.provider.uses_gateway() {
+            continue;
+        }
         let credential = if credential.provider.supports_refresh()
             && credential.expires_at.is_some_and(|expires_at| {
                 expires_at <= chrono::Utc::now().timestamp_millis() + REFRESH_MARGIN_MS

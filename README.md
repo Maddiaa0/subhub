@@ -1,23 +1,24 @@
 # Subhub
 
-Keep Claude Code and Codex running across multiple subscriptions.
+Keep Claude Code, Codex, and Antigravity CLI running across multiple subscriptions.
 
 Subhub stores OAuth credentials securely for the current platform, reports subscription
-usage, and routes both CLIs through an account for the appropriate provider
-that still has capacity.
+usage, routes Claude Code and Codex through an account for the appropriate provider
+that still has capacity, and switches Antigravity CLI accounts directly on disk.
 
 ## Features
 
-- Multiple named Claude Code and Codex accounts.
-- Usage visibility and capacity-aware routing.
+- Multiple named Claude Code, Codex, and Antigravity CLI accounts.
+- Usage visibility and capacity-aware routing for Claude Code and Codex.
 - Session affinity with one safe retry after pre-stream `401` or `429` errors.
+- Atomic account-file switching for Antigravity CLI (`~/.gemini/antigravity-cli/antigravity-oauth-token`) with automatic sync-back of tokens refreshed by `agy`.
 - A persistent per-user macOS LaunchAgent or Linux systemd service.
 - Keychain-backed storage on macOS and permission-restricted file storage on Linux.
 
 ## Getting started
 
 Subhub requires macOS or Linux, Rust nightly 1.98 (`nightly-2026-06-21`) or a newer
-nightly, and the `claude` and `codex` CLIs for their respective providers.
+nightly, and the `claude`, `codex`, and `agy` CLIs for their respective providers.
 
 ```sh
 cargo install subhub
@@ -30,12 +31,15 @@ subhub gateway install
 
 To install from a local checkout, run `cargo install --path .`.
 
-`subhub add` prompts for Claude Code or Codex. Claude accounts use the standard
+`subhub add` prompts for Claude Code, Codex, or Antigravity CLI (or pass `--provider claude|codex|antigravity` to skip the prompt). Claude accounts use the standard
 `claude auth login --claudeai` flow by default. Pass `--capture` to import
-Claude Code's current OAuth login without opening a browser. Codex accounts are
+Claude Code's or Antigravity CLI's current OAuth login without opening a browser. Codex accounts are
 captured after a standard `codex login` ChatGPT flow in an isolated temporary
 credential cache; pass `--device-auth` on remote or headless machines to use
-the device-code flow instead of a local browser. On macOS, tokens are stored in the login Keychain. On Linux,
+the device-code flow instead of a local browser. Antigravity CLI accounts are
+captured either with `--capture` (from `~/.gemini/antigravity-cli/antigravity-oauth-token`,
+overridable via `SUBHUB_ANTIGRAVITY_TOKEN_PATH`) or via `agy acp --login` in an
+isolated temporary home directory. On macOS, tokens are stored in the login Keychain. On Linux,
 they are stored in `$XDG_CONFIG_HOME/subhub/credentials.json` (defaulting to
 `~/.config/subhub/credentials.json`) with user-only permissions. Tokens are
 never written to the Subhub index.
@@ -47,21 +51,22 @@ shared or made group/world-readable.
 ## Commands
 
 ```text
-subhub add <name> [--force] [--capture] [--device-auth]
+subhub add <name> [--provider claude|codex|antigravity] [--force] [--capture] [--device-auth]
                                   Save or replace an account
-                                  (--capture: import Claude's current login)
+                                  (--capture: import Claude's or Antigravity's current login)
                                   (--device-auth: Codex device-code login)
 subhub list                       List accounts and their providers
-subhub set <name> [--provider claude|codex]
-                                  Select the gateway's preferred account
-subhub audit [--json]             Show subscription usage
-subhub push <name> --remote <url> Push a saved credential to a remote
+subhub set <name> [--provider claude|codex|antigravity]
+                                  Select the preferred account (or swap the active
+                                  Antigravity token file on disk)
+subhub audit [--json]             Show subscription usage (and local Antigravity token status)
+subhub push <name> --remote <url> Push a saved Claude/Codex credential to a remote
                                   gateway's admin API (token via
                                   --admin-token or SUBHUB_ADMIN_TOKEN)
 
 subhub gateway install            Install and start the background gateway
 subhub gateway reinstall          Uninstall then install, preserving accounts
-subhub gateway status [--provider claude|codex]
+subhub gateway status [--provider claude|codex|antigravity]
                                   Show gateway health, optionally filtered
 subhub gateway logs [--lines 100] Show structured gateway events
 subhub gateway doctor             Diagnose routing and credential health
@@ -92,6 +97,13 @@ Claude Code requests are forwarded to Anthropic using saved Claude accounts.
 Codex Responses API requests arrive under `/openai` and are forwarded to the
 Codex upstream using saved Codex accounts. Provider selection is isolated, so
 credentials are never routed across subscription types.
+
+Antigravity CLI (`agy`) accounts are managed as a local account-file switcher
+rather than proxied through the gateway: `subhub add <name> --provider antigravity`
+saves the `antigravity-oauth-token` JSON in the vault, and `subhub set <name>`
+atomically swaps `~/.gemini/antigravity-cli/antigravity-oauth-token` (syncing
+any token refreshed by `agy` back to the previously active vault entry first).
+`agy` continues talking directly to Google and handling its own OAuth refreshes.
 
 The foreground server prints the environment needed by Claude Code:
 

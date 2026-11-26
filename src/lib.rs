@@ -1,7 +1,9 @@
-//! Subhub routes Claude Code and Codex traffic through saved subscription
-//! credentials via a local gateway.
+//! Subhub manages Claude Code, Codex, and Antigravity CLI subscription
+//! credentials: routing Claude Code and Codex through a local gateway and
+//! switching Antigravity CLI accounts directly on disk.
 //!
 //! Module map:
+//! - [`antigravity`]: Antigravity CLI token-file switching helpers
 //! - [`cli`]: clap definitions and command handlers
 //! - [`credentials`]: vault storage, the name index, and OAuth refresh
 //! - [`gateway`]: the local HTTP proxy (routing, auditing, refresh)
@@ -11,6 +13,7 @@
 //! - [`output`]: terminal rendering shared by CLI commands
 //! - [`observability`]: structured gateway event log
 
+mod antigravity;
 mod cli;
 mod codex;
 mod credentials;

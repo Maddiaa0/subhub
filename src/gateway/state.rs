@@ -18,20 +18,22 @@ pub(crate) struct SelectedAccounts {
 
 impl SelectedAccounts {
     pub(crate) fn get(&self, provider: Provider) -> Option<String> {
-        self.slot_ref(provider).clone()
+        self.slot_ref(provider).and_then(Clone::clone)
     }
 
-    fn slot_ref(&self, provider: Provider) -> &Option<String> {
+    fn slot_ref(&self, provider: Provider) -> Option<&Option<String>> {
         match provider {
-            Provider::Claude => &self.claude,
-            Provider::Codex => &self.codex,
+            Provider::Claude => Some(&self.claude),
+            Provider::Codex => Some(&self.codex),
+            Provider::Antigravity => None,
         }
     }
 
-    pub(crate) fn slot(&mut self, provider: Provider) -> &mut Option<String> {
+    pub(crate) fn slot(&mut self, provider: Provider) -> Option<&mut Option<String>> {
         match provider {
-            Provider::Claude => &mut self.claude,
-            Provider::Codex => &mut self.codex,
+            Provider::Claude => Some(&mut self.claude),
+            Provider::Codex => Some(&mut self.codex),
+            Provider::Antigravity => None,
         }
     }
 

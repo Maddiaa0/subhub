@@ -57,8 +57,10 @@ pub(super) async fn select_credential(
             .min_by_key(|credential| health[&credential.name].checked_at)
             .cloned()
     });
-    if let Some(credential) = &selected {
-        *state.selected.lock().await.slot(provider) = Some(credential.name.clone());
+    if let Some(credential) = &selected
+        && let Some(slot) = state.selected.lock().await.slot(provider)
+    {
+        *slot = Some(credential.name.clone());
     }
     selected
 }
@@ -82,7 +84,11 @@ pub(super) async fn set_selected_account(state: &ProxyState, name: &str) -> bool
     else {
         return false;
     };
-    *state.selected.lock().await.slot(provider) = Some(name.to_owned());
+    let mut selected = state.selected.lock().await;
+    let Some(slot) = selected.slot(provider) else {
+        return false;
+    };
+    *slot = Some(name.to_owned());
     true
 }
 

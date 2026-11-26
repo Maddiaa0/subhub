@@ -234,6 +234,28 @@ pub(crate) fn restart() -> Result<()> {
 }
 
 pub(crate) fn status(provider: Option<crate::Provider>) -> Result<()> {
+    if provider == Some(crate::Provider::Antigravity) {
+        let index = load_index(&index_path()?)?;
+        let active = index
+            .active_for(crate::Provider::Antigravity)
+            .filter(|name| {
+                crate::credentials::vault::vault_read(name)
+                    .ok()
+                    .and_then(|raw| {
+                        serde_json::from_str::<crate::credentials::vault::VaultEntry>(&raw).ok()
+                    })
+                    .is_some_and(|entry| entry.provider == crate::Provider::Antigravity)
+            });
+        println!("Mode:      local account-file switcher (not routed through gateway)");
+        println!(
+            "Token:     {}",
+            crate::antigravity::token_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "unknown".into())
+        );
+        println!("Active:    {}", active.unwrap_or("none"));
+        return Ok(());
+    }
     let installed = background_service_path()?.exists() && install_state_path()?.exists();
     let running = background_service_running();
     println!("Installed: {}", yes_no(installed));
